@@ -45,7 +45,7 @@ from pathlib import Path
 
 
 APP_NAME = "离线安卓 AI"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.8.1"
 SDK_TERMS_URL = "https://developer.android.com/studio/terms"
 
 
@@ -107,36 +107,103 @@ def persistent_action(action, identity_key=None):
     return stored
 
 
-def screenshot_signature(png):
+def same_input_identity(previous, current):
+    if previous.get("kind") != "type" or current.get("kind") != "type":
+        return False
+    first_id = previous.get("text_id")
+    second_id = current.get("text_id")
+    return (isinstance(first_id, str) and isinstance(second_id, str)
+            and bool(first_id) and hmac.compare_digest(first_id, second_id)
+            and previous.get("x") == current.get("x")
+            and previous.get("y") == current.get("y")
+            and bool(previous.get("clear")) == bool(current.get("clear")))
+
+
+_screen_signature_cache = collections.OrderedDict()
+_screen_signature_lock = threading.Lock()
+
+
+def screenshot_fingerprints(png):
     fallback = hashlib.sha256(png).hexdigest()[:24]
+    with _screen_signature_lock:
+        cached = _screen_signature_cache.get(fallback)
+        if cached is not None:
+            _screen_signature_cache.move_to_end(fallback)
+            return dict(cached)
+    fingerprints = _calculate_screen_fingerprints(png, fallback)
+    with _screen_signature_lock:
+        _screen_signature_cache[fallback] = fingerprints
+        _screen_signature_cache.move_to_end(fallback)
+        while len(_screen_signature_cache) > 48:
+            _screen_signature_cache.popitem(last=False)
+    return dict(fingerprints)
+
+
+def screenshot_signature(png):
+    return screenshot_fingerprints(png)["perceptual"]
+
+
+def stamp_screenshot(observation, png):
+    fingerprints = screenshot_fingerprints(png)
+    observation["image_signature"] = fingerprints["perceptual"]
+    observation["image_exact_signature"] = fingerprints["exact"]
+    observation["image_encoded_signature"] = fingerprints["encoded"]
+    return observation
+
+
+def _calculate_screen_signature(png, fallback):
+    return _calculate_screen_fingerprints(png, fallback)["perceptual"]
+
+
+def _calculate_screen_fingerprints(png, fallback):
+    fallback_result = {"perceptual": fallback, "exact": fallback, "encoded": fallback}
     if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) < 33:
-        return fallback
+        return fallback_result
     try:
         width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", png[16:29])
         channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color)
-        if not channels or depth != 8 or interlace != 0 or not 0 < width <= 4096 or not 0 < height <= 4096:
-            return fallback
+        if not channels or depth != 8 or interlace != 0 or compression != 0 or filtering != 0 or not 0 < width <= 4096 or not 0 < height <= 4096:
+            return fallback_result
+        stride = width * channels
+        expected = height * (stride + 1)
+        if expected > 24 * 1048576:
+            return fallback_result
         offset = 8
         parts = []
+        palette = None
+        transparency = b""
         while offset + 12 <= len(png):
             size = struct.unpack(">I", png[offset:offset + 4])[0]
             kind = png[offset + 4:offset + 8]
             if size > len(png) - offset - 12:
-                return fallback
+                return fallback_result
+            data = png[offset + 8:offset + 8 + size]
             if kind == b"IDAT":
-                parts.append(png[offset + 8:offset + 8 + size])
+                parts.append(data)
+            elif kind == b"PLTE":
+                palette = data
+            elif kind == b"tRNS":
+                transparency = data
             offset += 12 + size
             if kind == b"IEND":
                 break
-        pixels = zlib.decompress(b"".join(parts))
-        stride = width * channels
-        if len(pixels) != height * (stride + 1):
-            return fallback
+        if color == 3 and (not palette or len(palette) % 3 or len(palette) > 768):
+            return fallback_result
+        decompressor = zlib.decompressobj()
+        pixels = decompressor.decompress(b"".join(parts), expected + 1)
+        if len(pixels) != expected or not decompressor.eof or decompressor.unconsumed_tail:
+            return fallback_result
         first_row = int(height * 0.06)
         last_row = max(first_row + 1, int(height * 0.97))
-        columns = [min(width - 1, round(width * (i + 0.5) / 48)) for i in range(48)]
+        columns = [min(width - 1, int(width * (i + 0.5) / 48)) for i in range(48)]
+        sampled_rows = {first_row + (last_row - first_row - 1) * i // 63 for i in range(64)}
         previous = bytearray(stride)
-        signature = bytearray()
+        signature = bytearray(struct.pack(">II", width, height))
+        full_digest = hashlib.sha256(struct.pack(">IIB", width, height, color))
+        if color == 3 and palette:
+            full_digest.update(palette)
+        if transparency:
+            full_digest.update(transparency)
         position = 0
         for y in range(height):
             mode = pixels[position]
@@ -161,15 +228,29 @@ def screenshot_signature(png):
                     a, b, c = abs(estimate - left), abs(estimate - up), abs(estimate - upper_left)
                     row[i] = (row[i] + (left if a <= b and a <= c else up if b <= c else upper_left)) & 255
             elif mode != 0:
-                return fallback
-            if first_row <= y < last_row:
+                return fallback_result
+            full_digest.update(row)
+            if y in sampled_rows:
                 for x in columns:
                     pos = x * channels
-                    signature.extend((value >> 4 for value in row[pos:pos + min(3, channels)]))
+                    if color == 3:
+                        index = row[pos]
+                        start = index * 3
+                        if start + 3 > len(palette):
+                            return fallback_result
+                        rgb = palette[start:start + 3]
+                        alpha = transparency[index] if index < len(transparency) else 255
+                    elif color in (0, 4):
+                        rgb = (row[pos],) * 3
+                        alpha = row[pos + 1] if color == 4 else 255
+                    else:
+                        rgb = row[pos:pos + 3]
+                        alpha = row[pos + 3] if color == 6 else 255
+                    signature.extend((rgb[0] >> 4, rgb[1] >> 4, rgb[2] >> 4, alpha >> 4))
             previous = row
-        return hashlib.sha256(signature).hexdigest()[:24]
+        return {"perceptual": hashlib.sha256(signature).hexdigest()[:24], "exact": full_digest.hexdigest()[:24], "encoded": fallback}
     except (ValueError, IndexError, OSError, zlib.error, struct.error):
-        return fallback
+        return fallback_result
 
 
 def stable_screen_text(value):
@@ -193,7 +274,13 @@ def persistent_summary(observation):
 
 def persistent_observation(observation):
     safe = dict(observation)
-    safe["nodes"] = [{**node, "text": "[输入控件内容已隐藏]", "description": ""} if node.get("editable") else dict(node) for node in observation.get("nodes", [])]
+    safe["nodes"] = []
+    for node in observation.get("nodes", []):
+        clean = {key: value for key, value in node.items() if not str(key).startswith("_")}
+        if clean.get("editable"):
+            clean["text"] = "[输入控件内容已隐藏]"
+            clean["description"] = ""
+        safe["nodes"].append(clean)
     safe["summary"] = persistent_summary(observation)
     return safe
 
@@ -253,14 +340,20 @@ def runtime_resource_budget(total_mb, available_mb, cpu_count, ai_loaded=False, 
     protected_mb = max(1024, min(3072, int(total_mb * 0.15)))
     model_reserve = 0 if ai_loaded else 1450
     vision_reserve = 0 if vision_loaded else 900
-    capacity = min(2048, total_mb // 4, available_mb - protected_mb - model_reserve)
+    android_cap = 2048 if total_mb < 12288 else 3072 if total_mb < 16384 else 4096 if total_mb < 32768 else 6144
+    capacity = min(android_cap, total_mb // 3, available_mb - protected_mb - model_reserve)
     android_mb = max(0, (capacity // 256) * 256)
-    accessible_cores = max(1, cpu_count - max(1, cpu_count // 4))
-    android_cores = max(1, min(4, (accessible_cores + 1) // 2))
-    ai_cores = max(1, min(4, accessible_cores - android_cores))
-    vision_cores = max(1, min(3, ai_cores))
-    parallel_needed = protected_mb + model_reserve + vision_reserve + 450
-    parallel_vision = cpu_count >= 8 and total_mb >= 12288 and available_mb >= parallel_needed
+    accessible_cores = max(1, cpu_count - max(1, math.ceil(cpu_count * 0.25)))
+    android_cores = max(1, min(6 if cpu_count >= 12 and total_mb >= 16384 else 4, (accessible_cores + 1) // 2))
+    model_cores = max(1, accessible_cores - android_cores)
+    parallel_needed = protected_mb + model_reserve + vision_reserve + max(1024, android_mb) + 450
+    parallel_vision = cpu_count >= 8 and model_cores >= 2 and total_mb >= 12288 and available_mb >= parallel_needed
+    if parallel_vision:
+        vision_cores = max(1, min(3, model_cores // 3))
+        ai_cores = max(1, min(6 if cpu_count >= 16 else 4, model_cores - vision_cores))
+    else:
+        ai_cores = max(1, min(6 if cpu_count >= 16 else 4, model_cores))
+        vision_cores = max(1, min(3, model_cores))
     return {"android_mb": android_mb, "android_cores": android_cores, "ai_threads": ai_cores, "vision_threads": vision_cores, "protected_mb": protected_mb, "available_mb": available_mb, "parallel_vision": parallel_vision}
 
 
@@ -272,6 +365,12 @@ def goal_similarity(first, second):
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+def realtime_goal(goal):
+    content = str(goal or "").casefold()
+    markers = ("游戏", "实时对战", "对局", "电竞", "王者荣耀", "部落冲突", "皇室战争", "海岛奇兵", "我的世界", "百万领主", "欢乐斗地主", "战争艺术3", "honor of kings", "clash of clans", "clash royale", "boom beach", "minecraft", "million lords", "happy poker", "art of war 3", "gameplay", "playing games")
+    return any(marker in content for marker in markers)
 
 
 class UIEventQueue:
@@ -292,6 +391,11 @@ class UIEventQueue:
                         break
             if len(self.items) >= self.limit:
                 removable = next((i for i, value in enumerate(self.items) if value[0] in {"log", "status", "stats"}), None)
+                if removable is None and kind in {"log", "status", "stats"}:
+                    self.dropped += 1
+                    return
+                if removable is None:
+                    removable = next((i for i, value in enumerate(self.items) if value[0] in {"running", "stopping", "prepared"}), None)
                 if removable is None:
                     self.items.popleft()
                 else:
@@ -343,7 +447,13 @@ class Fetcher:
             return self._hash(path, algorithm, cancel).lower() == digest.lower()
         return info.st_size > 0
 
-    def fetch(self, url, dest, expected_size=None, digest=None, algorithm="sha256", cancel=None, validator=None):
+    @staticmethod
+    def _require_disk_space(folder, remaining_bytes, minimum_free=268435456):
+        needed = max(0, int(remaining_bytes)) + minimum_free
+        if shutil.disk_usage(folder).free < needed:
+            raise OSError("下载所需磁盘空间不足，需额外保留 " + str(math.ceil(needed / 1048576)) + " MB")
+
+    def fetch(self, url, dest, expected_size=None, digest=None, algorithm="sha256", cancel=None, validator=None, max_bytes=8589934592):
         check_cancel(cancel)
         if urllib.parse.urlsplit(url).scheme != "https":
             raise ValueError("下载地址必须使用 HTTPS")
@@ -374,6 +484,12 @@ class Fetcher:
             if expected_size and offset > int(expected_size):
                 partial.unlink()
                 offset = 0
+            if expected_size is not None:
+                self._require_disk_space(dest.parent, int(expected_size) - offset)
+            else:
+                self._require_disk_space(dest.parent, 0)
+            if max_bytes is not None and offset > int(max_bytes):
+                raise ValueError("下载临时文件超过最大允许大小")
             try:
                 headers = {"User-Agent": "AndroidAI/" + APP_VERSION, "Accept-Encoding": "identity"}
                 if offset:
@@ -386,29 +502,43 @@ class Fetcher:
                         raise ValueError("服务器将下载重定向到了非 HTTPS 地址")
                     code = response.getcode()
                     content_range = response.headers.get("Content-Range", "")
-                    if offset and code == 206:
-                        matched = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range)
-                        if not matched or int(matched.group(1)) != offset:
-                            raise ValueError("续传位置与服务器响应不一致")
-                    elif offset:
-                        offset = 0
                     if code not in (200, 206):
                         raise OSError("下载状态码 " + str(code))
+                    matched = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip()) if code == 206 else None
+                    if code == 206 and (matched is None or int(matched.group(1)) != offset or int(matched.group(2)) < offset):
+                        raise ValueError("服务器返回了无效的分段下载范围")
+                    if offset and code == 200:
+                        offset = 0
                     length = response.headers.get("Content-Length")
-                    total = int(expected_size) if expected_size else (offset + int(length) if length and length.isdecimal() else 0)
+                    if matched is not None and length and length.isdecimal() and int(length) != int(matched.group(2)) - offset + 1:
+                        raise ValueError("分段下载长度与响应头不一致")
+                    range_total = int(matched.group(3)) if matched is not None and matched.group(3).isdecimal() else 0
+                    if range_total and expected_size is not None and range_total != int(expected_size):
+                        raise ValueError("分段下载总大小与声明不一致")
+                    total = int(expected_size) if expected_size is not None else range_total or (offset + int(length) if length and length.isdecimal() else 0)
+                    if expected_size is None and total:
+                        self._require_disk_space(dest.parent, max(0, total - offset))
                     mode = "ab" if offset else "wb"
                     transferred = offset
                     last_update = 0.0
+                    last_space_check = offset
+                    if max_bytes is not None and total > int(max_bytes):
+                        raise ValueError("下载文件超过最大允许大小")
                     with partial.open(mode) as output:
                         while True:
                             check_cancel(cancel)
                             chunk = response.read1(262144)
                             if not chunk:
                                 break
-                            output.write(chunk)
                             transferred += len(chunk)
-                            if expected_size and transferred > int(expected_size):
+                            if expected_size is not None and transferred > int(expected_size):
                                 raise ValueError("下载文件超过声明大小")
+                            if max_bytes is not None and transferred > int(max_bytes):
+                                raise ValueError("下载文件超过最大允许大小")
+                            if transferred - last_space_check >= 16 * 1048576:
+                                self._require_disk_space(dest.parent, 0)
+                                last_space_check = transferred
+                            output.write(chunk)
                             if time.monotonic() - last_update >= 0.7:
                                 detail = f"{transferred / 1048576:.1f} MB"
                                 if total:
@@ -449,7 +579,11 @@ class Fetcher:
             except urllib.error.HTTPError as exc:
                 error = exc
                 if exc.code == 416:
-                    if self._valid(partial, expected_size, digest, algorithm, cancel):
+                    range_header = exc.headers.get("Content-Range", "") if exc.headers is not None else ""
+                    length_match = re.fullmatch(r"bytes \*/(\d+)", range_header.strip())
+                    size_confirmed = bool(length_match and partial.is_file() and partial.stat().st_size == int(length_match.group(1)))
+                    trust_partial = digest is not None or expected_size is not None or (validator is not None and size_confirmed)
+                    if trust_partial and self._valid(partial, expected_size, digest, algorithm, cancel):
                         try:
                             acceptable = validator is None or bool(validator(partial))
                         except (OSError, ValueError, ET.ParseError):
@@ -610,6 +744,16 @@ class MemoryStore:
         self.fts_available = False
         with self.lock:
             self.db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=15000; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, goal TEXT NOT NULL, state TEXT NOT NULL, screen TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL, next_state TEXT NOT NULL, reward REAL NOT NULL, feedback REAL NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS episodes_state ON episodes(state,id); CREATE TABLE IF NOT EXISTS policy(goal_key TEXT NOT NULL, state TEXT NOT NULL, action_key TEXT NOT NULL, action TEXT NOT NULL, n INTEGER NOT NULL, score REAL NOT NULL, PRIMARY KEY(goal_key,state,action_key)); CREATE TABLE IF NOT EXISTS knowledge(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, digest TEXT NOT NULL UNIQUE); CREATE TABLE IF NOT EXISTS states(state TEXT PRIMARY KEY, first_seen TEXT NOT NULL, visits INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS knowledge_meta(knowledge_id INTEGER PRIMARY KEY REFERENCES knowledge(id) ON DELETE CASCADE, category TEXT NOT NULL, verified INTEGER NOT NULL, context TEXT NOT NULL); CREATE TABLE IF NOT EXISTS episode_features(episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE, resource TEXT NOT NULL, package TEXT NOT NULL, node_class TEXT NOT NULL, label TEXT NOT NULL, action_kind TEXT NOT NULL, verification TEXT NOT NULL); CREATE INDEX IF NOT EXISTS episode_features_resource ON episode_features(resource,episode_id);")
+            self.db.executescript("CREATE TABLE IF NOT EXISTS archived_experience(goal TEXT NOT NULL, state TEXT NOT NULL, visual_state TEXT NOT NULL, resource TEXT NOT NULL, package TEXT NOT NULL, node_class TEXT NOT NULL, label TEXT NOT NULL, action_kind TEXT NOT NULL, verification TEXT NOT NULL, n INTEGER NOT NULL, reward_sum REAL NOT NULL, feedback_sum REAL NOT NULL, last_episode_id INTEGER NOT NULL, PRIMARY KEY(goal,state,visual_state,resource,package,node_class,label,action_kind,verification)); CREATE INDEX IF NOT EXISTS archived_experience_resource ON archived_experience(resource,last_episode_id); CREATE INDEX IF NOT EXISTS archived_experience_state ON archived_experience(state,last_episode_id);")
+            self.db.executescript("CREATE TABLE IF NOT EXISTS successful_routes(goal TEXT NOT NULL, state TEXT NOT NULL, signature TEXT NOT NULL, steps TEXT NOT NULL, successes INTEGER NOT NULL DEFAULT 1, last_seen TEXT NOT NULL, PRIMARY KEY(goal,state,signature)); CREATE INDEX IF NOT EXISTS successful_routes_rank ON successful_routes(goal,state,successes DESC,last_seen DESC);")
+            route_version = self.db.execute("SELECT value FROM settings WHERE key='successful_route_version'").fetchone()
+            if route_version is None or route_version[0] != '2':
+                self.db.execute("DELETE FROM successful_routes")
+                self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('successful_route_version','2')")
+            self.db.executescript("CREATE INDEX IF NOT EXISTS episode_features_label ON episode_features(label,episode_id); CREATE INDEX IF NOT EXISTS archived_experience_label ON archived_experience(label,last_episode_id);")
+            archive_columns = {row[1] for row in self.db.execute("PRAGMA table_info(archived_experience)")}
+            if "ineffective_count" not in archive_columns:
+                self.db.execute("ALTER TABLE archived_experience ADD COLUMN ineffective_count INTEGER NOT NULL DEFAULT 0")
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(policy)")}
             for name in ("verified_success", "verified_failure", "unverified", "observed_effect"):
                 if name not in columns:
@@ -620,6 +764,7 @@ class MemoryStore:
             if "visual_state" not in episode_columns:
                 self.db.execute("ALTER TABLE episodes ADD COLUMN visual_state TEXT NOT NULL DEFAULT ''")
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS episodes_action_id_unique ON episodes(action_id) WHERE action_id IS NOT NULL")
+            self.db.execute("CREATE INDEX IF NOT EXISTS episodes_goal_recent ON episodes(goal,id)")
             self._migrate_knowledge()
             try:
                 exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_fts'").fetchone() is not None
@@ -705,6 +850,11 @@ class MemoryStore:
         return None
 
     @staticmethod
+    def _semantic_key(label):
+        label = re.sub(r"\s+", " ", stable_screen_text(str(label)[:160]).strip()).casefold()
+        return ("semantic", label[:100]) if len(label) >= 2 else None
+
+    @staticmethod
     def _action_node(observation, action):
         nodes = observation.get("nodes", [])
         target = action.get("target", -1)
@@ -735,37 +885,55 @@ class MemoryStore:
                 result = json.loads(row["result"])
             except (TypeError, ValueError):
                 continue
-            if previous.get("kind") == "type" and previous.get("x") == packed.get("x") and previous.get("y") == packed.get("y") and result.get("verification") in ("unverified", "unverified_after_error", "unverified_after_interruption", "observed_after_interruption"):
+            if isinstance(previous, dict) and isinstance(result, dict) and same_input_identity(previous, packed) and result.get("verification") in ("unverified", "unverified_after_error", "unverified_after_interruption", "observed_after_interruption"):
                 return True
         return False
 
     def action_guidance(self, goal, observation):
         nodes = observation.get("nodes", [])
         resources = list(dict.fromkeys(str(node.get("resource", "")) for node in nodes if node.get("resource")))[:40]
+        labels = list(dict.fromkeys((str(node.get("text", "")) + " " + str(node.get("description", ""))).strip()[:160] for node in nodes if not node.get("editable") and (node.get("text") or node.get("description"))))[:30]
         conditions = ["episodes.state=?"]
+        archived_conditions = ["state=?"]
         values = [learning_state(observation)]
         if resources:
-            conditions.append("episode_features.resource IN (" + ",".join("?" for _ in resources) + ")")
+            slots = ",".join("?" for _ in resources)
+            conditions.append("episode_features.resource IN (" + slots + ")")
+            archived_conditions.append("resource IN (" + slots + ")")
             values.extend(resources)
-        query = "SELECT episodes.goal,episodes.state,episodes.visual_state,episodes.reward,episodes.feedback,episode_features.resource,episode_features.package,episode_features.node_class,episode_features.label,episode_features.action_kind,episode_features.verification FROM episodes JOIN episode_features ON episode_features.episode_id=episodes.id WHERE (" + " OR ".join(conditions) + ") ORDER BY episodes.id DESC LIMIT 280"
-        with self.lock:
-            rows = self.db.execute(query, values).fetchall()
-        guidance = {}
+        if labels:
+            slots = ",".join("?" for _ in labels)
+            conditions.append("episode_features.label IN (" + slots + ")")
+            archived_conditions.append("label IN (" + slots + ")")
+            values.extend(labels)
         state = learning_state(observation)
+        priority = [goal, state, goal, state]
+        query = "SELECT episodes.goal,episodes.state,episodes.visual_state,episodes.reward,episodes.feedback,episode_features.resource,episode_features.package,episode_features.node_class,episode_features.label,episode_features.action_kind,episode_features.verification,1 AS sample_count FROM episodes JOIN episode_features ON episode_features.episode_id=episodes.id WHERE (" + " OR ".join(conditions) + ") ORDER BY CASE WHEN episodes.goal=? AND episodes.state=? THEN 3 WHEN episodes.goal=? THEN 2 WHEN episodes.state=? THEN 1 ELSE 0 END DESC,episodes.id DESC LIMIT 360"
+        archived_query = "SELECT goal,state,visual_state,reward_sum/n AS reward,feedback_sum/n AS feedback,resource,package,node_class,label,action_kind,verification,n AS sample_count FROM archived_experience WHERE (" + " OR ".join(archived_conditions) + ") ORDER BY CASE WHEN goal=? AND state=? THEN 3 WHEN goal=? THEN 2 WHEN state=? THEN 1 ELSE 0 END DESC,n DESC,last_episode_id DESC LIMIT 600"
+        with self.lock:
+            rows = self.db.execute(query, values + priority).fetchall()
+            rows += self.db.execute(archived_query, values + priority).fetchall()
+        guidance = {}
+        current_visual = visual_state(observation)
         for row in rows:
             similarity = 1.0 if row["goal"] == goal else goal_similarity(goal, row["goal"])
             if similarity < 0.28:
                 continue
+            keys = []
             if row["resource"]:
-                key = ("resource", row["package"], row["resource"])
+                keys.append((("resource", row["package"], row["resource"]), 1.0))
             elif row["label"]:
-                key = ("label", row["package"], row["node_class"], stable_screen_text(row["label"])[:100])
-            else:
+                keys.append((("label", row["package"], row["node_class"], stable_screen_text(row["label"])[:100]), 1.0))
+            if row["label"] and row["verification"] in ("verified_success", "verified_effect"):
+                semantic = self._semantic_key(row["label"])
+                if semantic is not None:
+                    keys.append((semantic, 0.55))
+            if not keys:
                 continue
             action_kind = row["action_kind"]
             affinity = similarity * (1.0 if row["state"] == state else 0.65)
-            if visual_state(observation) and row["visual_state"]:
-                affinity *= 1.12 if row["visual_state"] == visual_state(observation) else 0.8
+            if current_visual and row["visual_state"]:
+                affinity *= 1.12 if row["visual_state"] == current_visual else 0.8
             verification = row["verification"]
             score = (float(row["reward"]) + max(-2.0, min(2.0, float(row["feedback"]))) * 0.25) * affinity
             if verification == "verified_success":
@@ -776,10 +944,56 @@ class MemoryStore:
                 score -= 1.1 * affinity
             elif verification in ("unverified", "unverified_after_error", "unverified_after_interruption", "observed_after_interruption"):
                 score -= 0.3 * affinity
-            current = guidance.setdefault((key, action_kind), [0.0, 0])
-            current[0] += score
-            current[1] += 1
+            weight = max(1, int(row["sample_count"]))
+            for key, transfer_weight in keys:
+                current = guidance.setdefault((key, action_kind), [0.0, 0])
+                current[0] += score * weight * transfer_weight
+                current[1] += weight
         return {key: (value[0] / value[1], value[1]) for key, value in guidance.items()}
+
+    def state_action_stats(self, goal, observation, limit=400):
+        state = learning_state(observation)
+        with self.lock:
+            recent = self.db.execute("SELECT episode_features.resource,episode_features.package,episode_features.node_class,episode_features.label,episode_features.action_kind,episodes.result FROM episodes JOIN episode_features ON episode_features.episode_id=episodes.id WHERE episodes.goal=? AND episodes.state=? ORDER BY episodes.id DESC LIMIT ?", (goal, state, max(1, int(limit)))).fetchall()
+            archived = self.db.execute("SELECT resource,package,node_class,label,action_kind,verification,n,ineffective_count FROM archived_experience WHERE goal=? AND state=? ORDER BY last_episode_id DESC LIMIT ?", (goal, state, max(1, int(limit)))).fetchall()
+        totals = {}
+        def entry(row):
+            if row["resource"]:
+                node_key = ("resource", row["package"], row["resource"])
+            elif row["label"]:
+                node_key = ("label", row["package"], row["node_class"], stable_screen_text(row["label"])[:100])
+            else:
+                return None
+            return totals.setdefault((node_key, row["action_kind"]), {"attempts": 0, "ineffective": 0, "failures": 0, "successes": 0})
+        for row in recent:
+            item = entry(row)
+            if item is None:
+                continue
+            item["attempts"] += 1
+            try:
+                result = json.loads(row["result"])
+            except (ValueError, TypeError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            if result.get("screen_changed") is False and result.get("effect_observed") is not True:
+                item["ineffective"] += 1
+            if result.get("verification") == "verified_failure":
+                item["failures"] += 1
+            if result.get("verification") == "verified_success":
+                item["successes"] += 1
+        for row in archived:
+            item = entry(row)
+            if item is None:
+                continue
+            count = max(0, int(row["n"]))
+            item["attempts"] += count
+            item["ineffective"] += max(0, int(row["ineffective_count"]))
+            if row["verification"] == "verified_failure":
+                item["failures"] += count
+            elif row["verification"] == "verified_success":
+                item["successes"] += count
+        return totals
 
     def log(self, kind, **fields):
         payload = json.dumps(fields, ensure_ascii=False, default=str)
@@ -901,6 +1115,8 @@ class MemoryStore:
                 episode_id = cursor.lastrowid
                 self.db.execute("INSERT INTO episode_features(episode_id,resource,package,node_class,label,action_kind,verification) VALUES(?,?,?,?,?,?,?)", (episode_id, str(node.get("resource", ""))[:200], str(node.get("package", ""))[:150], str(node.get("class", ""))[:180], label, str(action.get("kind", ""))[:30], verification))
                 self.db.execute("INSERT INTO policy(goal_key,state,action_key,action,n,score,verified_success,verified_failure,unverified,observed_effect) VALUES(?,?,?,?,1,?,?,?,?,?) ON CONFLICT(goal_key,state,action_key) DO UPDATE SET score=(policy.score*policy.n+excluded.score)/(policy.n+1), n=policy.n+1, verified_success=policy.verified_success+excluded.verified_success, verified_failure=policy.verified_failure+excluded.verified_failure, unverified=policy.unverified+excluded.unverified, observed_effect=policy.observed_effect+excluded.observed_effect", (goal_key, state_key, action_key, packed, float(reward), successful, failed, unknown, observed))
+                if successful:
+                    self._learn_successful_route(goal, episode_id)
                 self.db.execute("RELEASE SAVEPOINT episode_record")
             except BaseException:
                 self.db.execute("ROLLBACK TO SAVEPOINT episode_record")
@@ -929,6 +1145,105 @@ class MemoryStore:
             self.db.commit()
         return True
 
+    def _learn_successful_route(self, goal, episode_id):
+        rows = self.db.execute("SELECT episodes.id,episodes.ts,episodes.goal,episodes.state,episodes.next_state,episode_features.resource,episode_features.package,episode_features.label,episode_features.action_kind,episode_features.verification FROM episodes JOIN episode_features ON episode_features.episode_id=episodes.id WHERE episodes.id<=? ORDER BY episodes.id DESC LIMIT 8", (episode_id,)).fetchall()
+        recent = []
+        last_time = None
+        successor = None
+        for row in rows:
+            if row["goal"] != goal or row["verification"] not in {"verified_success", "verified_effect", "observed_change"}:
+                break
+            if successor is not None and (row["id"] + 1 != successor["id"] or row["next_state"] != successor["state"]):
+                break
+            try:
+                when = datetime.datetime.fromisoformat(row["ts"])
+            except (ValueError, TypeError):
+                break
+            if last_time is not None and not 0 <= (last_time - when).total_seconds() <= 900:
+                break
+            last_time = when
+            successor = row
+            step = {"kind": row["action_kind"], "package": row["package"][:100], "resource": row["resource"][:150], "label": stable_screen_text(row["label"])[:80]}
+            recent.append((row["state"], step))
+        recent.reverse()
+        for start in range(len(recent)):
+            state = recent[start][0]
+            if not state:
+                continue
+            steps = [step for _, step in recent[start:]]
+            packed = json.dumps(steps, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            signature = hashlib.sha256(packed.encode("utf-8")).hexdigest()[:32]
+            self.db.execute("INSERT INTO successful_routes(goal,state,signature,steps,successes,last_seen) VALUES(?,?,?,?,1,?) ON CONFLICT(goal,state,signature) DO UPDATE SET successes=successes+1,last_seen=excluded.last_seen", (goal, state, signature, packed, utc_now()))
+
+    def successful_paths(self, goal, observation, limit=2):
+        current_state = learning_state(observation)
+        with self.lock:
+            routes = self.db.execute("SELECT steps,successes FROM successful_routes WHERE goal=? AND state=? ORDER BY successes DESC,last_seen DESC LIMIT ?", (goal, current_state, max(1, int(limit)))).fetchall()
+            if routes:
+                summaries = []
+                for route in routes:
+                    try:
+                        steps = json.loads(route["steps"])
+                    except (TypeError, ValueError):
+                        continue
+                    names = []
+                    for step in steps:
+                        kind = str(step.get("kind", ""))
+                        label = str(step.get("resource") or step.get("label") or "")
+                        names.append("type(输入内容已脱敏)" if kind == "type" else kind + "(" + label[:70] + ")" if label else kind)
+                    if names:
+                        summaries.append("历史完成路径（曾完成" + str(route["successes"]) + "次，仅末步确认目标达成）：" + " → ".join(names))
+                if summaries:
+                    return "\n".join(summaries)
+            rows = self.db.execute("SELECT episodes.id,episodes.ts,episodes.state,episodes.next_state,episodes.action,episode_features.resource,episode_features.label,episode_features.verification FROM episodes JOIN episode_features ON episode_features.episode_id=episodes.id WHERE episodes.goal=? ORDER BY episodes.id DESC LIMIT 450", (goal,)).fetchall()
+        if not rows:
+            return ""
+        ordered = list(reversed(rows))
+        paths = []
+        for endpoint in range(len(ordered) - 1, -1, -1):
+            final = ordered[endpoint]
+            if final["verification"] != "verified_success":
+                continue
+            window = ordered[max(0, endpoint - 7):endpoint + 1]
+            start = next((i for i in range(len(window) - 1, -1, -1) if window[i]["state"] == current_state), None)
+            if start is None:
+                continue
+            relevant = window[start:]
+            if any(row["verification"] not in {"verified_success", "verified_effect", "observed_change"} for row in relevant):
+                continue
+            if any(left["id"] + 1 != right["id"] or left["next_state"] != right["state"] for left, right in zip(relevant, relevant[1:])):
+                continue
+            if len(relevant) > 1:
+                try:
+                    times = [datetime.datetime.fromisoformat(row["ts"]) for row in relevant]
+                    if any((right - left).total_seconds() > 900 or right < left for left, right in zip(times, times[1:])):
+                        continue
+                except (ValueError, TypeError):
+                    continue
+            steps = []
+            for row in relevant:
+                try:
+                    action = json.loads(row["action"])
+                except (ValueError, TypeError):
+                    continue
+                kind = str(action.get("kind", ""))
+                label = str(row["resource"] or row["label"] or "")[:70]
+                if kind == "type":
+                    description = "type(输入内容已脱敏)"
+                elif label:
+                    description = kind + "(" + label + ")"
+                else:
+                    description = kind
+                steps.append(description)
+            if not steps:
+                continue
+            candidate = " → ".join(steps)
+            if candidate not in paths:
+                paths.append(candidate)
+            if len(paths) >= limit:
+                break
+        return "\n".join("历史完成路径（仅末步的目标完成经过验证，前序动作需结合当前界面判断）：" + path for path in paths)
+
     def recall(self, goal, observation, budget=4200):
         terms = []
         ignored = {"android", "widget", "clickable", "false", "true", "怎么", "如何", "这个", "当前", "安卓", "操作", "应用", "学习", "探索", "可以", "一个", "什么"}
@@ -944,7 +1259,8 @@ class MemoryStore:
             if len(terms) >= 22:
                 break
         terms = terms[:22]
-        parts = []
+        paths = self.successful_paths(goal, observation)
+        parts = [paths[:800]] if paths else []
         goal_key = hashlib.sha256(goal.encode("utf-8")).hexdigest()[:20]
         with self.lock:
             policies = self.db.execute("SELECT action,n,score,verified_success,verified_failure,unverified,observed_effect FROM policy WHERE state=? AND goal_key=? ORDER BY score DESC,n DESC LIMIT 6", (learning_state(observation), goal_key)).fetchall()
@@ -1002,6 +1318,7 @@ class MemoryStore:
     def stats(self):
         with self.lock:
             counts = {name: int(self.db.execute("SELECT COUNT(*) FROM " + name).fetchone()[0]) for name in ("episodes", "knowledge", "states", "events")}
+            counts["successful_routes"] = int(self.db.execute("SELECT COUNT(*) FROM successful_routes").fetchone()[0])
             row = self.db.execute("SELECT value FROM settings WHERE key='archived_episodes'").fetchone()
             archived = int(json.loads(row[0])) if row else 0
             counts["active_episodes"] = counts["episodes"]
@@ -1016,26 +1333,52 @@ class MemoryStore:
             return {}
         parameters = ",".join("?" for _ in resources)
         with self.lock:
-            rows = self.db.execute("SELECT resource,package,action_kind,verification,COUNT(*) AS attempts FROM episode_features WHERE resource IN (" + parameters + ") GROUP BY resource,package,action_kind,verification", resources).fetchall()
+            rows = self.db.execute("SELECT resource,package,action_kind,COUNT(*) AS attempts FROM episode_features WHERE resource IN (" + parameters + ") GROUP BY resource,package,action_kind", resources).fetchall()
+            archived = self.db.execute("SELECT resource,package,action_kind,SUM(n) AS attempts FROM archived_experience WHERE resource IN (" + parameters + ") GROUP BY resource,package,action_kind", resources).fetchall()
         counts = collections.Counter()
-        for row in rows:
+        for row in rows + archived:
             key = (("resource", row["package"], row["resource"]), row["action_kind"])
             counts[key] += row["attempts"]
         return dict(counts)
 
     def experience_quality(self, limit=250):
         with self.lock:
-            rows = self.db.execute("SELECT result FROM episodes ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+            rows = self.db.execute("SELECT result,reward FROM episodes ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
             states = self.db.execute("SELECT COUNT(*) FROM states").fetchone()[0]
-            unique_resources = self.db.execute("SELECT COUNT(DISTINCT resource) FROM episode_features WHERE resource<>''").fetchone()[0]
+            unique_resources = self.db.execute("SELECT COUNT(*) FROM (SELECT resource FROM episode_features WHERE resource<>'' UNION SELECT resource FROM archived_experience WHERE resource<>'')").fetchone()[0]
         counts = collections.Counter()
+        ineffective = 0
+        repeated = 0
+        reward_total = 0.0
         for row in rows:
             try:
                 data = json.loads(row["result"])
             except (TypeError, ValueError):
                 data = {}
+            if not isinstance(data, dict):
+                data = {}
             counts[str(data.get("verification", "unknown"))] += 1
-        return {"recent_actions": len(rows), "verified_goals": counts["verified_success"], "verified_effects": counts["verified_effect"], "verified_failures": counts["verified_failure"], "uncertain": sum(value for key, value in counts.items() if key.startswith("unverified") or key.startswith("observed_after") or key == "unknown"), "observed_changes": counts["observed_change"], "visited_states": states, "explored_resources": unique_resources}
+            ineffective += int(data.get("screen_changed") is False and data.get("effect_observed") is not True)
+            repeated += int(bool(data.get("repeated_transition")) or bool(data.get("repeated_ineffective_action")))
+            reward_total += float(row["reward"])
+        total = max(1, len(rows))
+        return {"recent_actions": len(rows), "verified_goals": counts["verified_success"], "verified_effects": counts["verified_effect"], "verified_failures": counts["verified_failure"], "uncertain": sum(value for key, value in counts.items() if key.startswith("unverified") or key.startswith("observed_after") or key == "unknown"), "observed_changes": counts["observed_change"], "visited_states": states, "explored_resources": unique_resources, "recent_verified_success_rate": round(counts["verified_success"] / total, 3), "recent_ineffective_rate": round(ineffective / total, 3), "recent_repetition_rate": round(repeated / total, 3), "recent_average_reward": round(reward_total / total, 3)}
+
+    def goal_quality(self, goal, limit=200):
+        with self.lock:
+            rows = self.db.execute("SELECT result,reward FROM episodes WHERE goal=? ORDER BY id DESC LIMIT ?", (str(goal), max(1, min(2000, int(limit))))).fetchall()
+        counts = collections.Counter()
+        for row in rows:
+            try:
+                result = json.loads(row["result"])
+            except (TypeError, ValueError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            counts[str(result.get("verification", "unknown"))] += 1
+            counts["repeated_actions"] += int(bool(result.get("repeated_ineffective_action")))
+        total = len(rows)
+        return {"goal": str(goal)[:240], "recent_actions": total, "verified_completions": counts["verified_success"], "verified_effects": counts["verified_effect"], "verified_failures": counts["verified_failure"], "observed_changes": counts["observed_change"], "unverified": sum(value for key, value in counts.items() if key.startswith("unverified") or key.startswith("observed_after") or key == "unknown"), "repeated_actions": counts["repeated_actions"], "completion_per_action": round(counts["verified_success"] / total, 3) if total else 0.0}
 
     def maintain(self, active_limit=20000, archive_batch=2000):
         active_limit = max(1, int(active_limit))
@@ -1067,6 +1410,25 @@ class MemoryStore:
                             temporary.unlink()
                     self.db.execute("SAVEPOINT episode_archive")
                     try:
+                        merged = {}
+                        for row in rows:
+                            if not row["feature_action"]:
+                                continue
+                            key = (row["goal"], row["state"], row["visual_state"] or "", row["feature_resource"] or "", row["feature_package"] or "", row["feature_class"] or "", row["feature_label"] or "", row["feature_action"], row["feature_verification"] or "unverified")
+                            item = merged.setdefault(key, [0, 0.0, 0.0, 0, 0])
+                            item[0] += 1
+                            item[1] += float(row["reward"])
+                            item[2] += float(row["feedback"])
+                            item[3] = max(item[3], int(row["id"]))
+                            try:
+                                result = json.loads(row["result"])
+                            except (ValueError, TypeError):
+                                result = {}
+                            if not isinstance(result, dict):
+                                result = {}
+                            if result.get("screen_changed") is False and result.get("effect_observed") is not True:
+                                item[4] += 1
+                        self.db.executemany("INSERT INTO archived_experience(goal,state,visual_state,resource,package,node_class,label,action_kind,verification,n,reward_sum,feedback_sum,last_episode_id,ineffective_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(goal,state,visual_state,resource,package,node_class,label,action_kind,verification) DO UPDATE SET n=n+excluded.n,reward_sum=reward_sum+excluded.reward_sum,feedback_sum=feedback_sum+excluded.feedback_sum,last_episode_id=MAX(last_episode_id,excluded.last_episode_id),ineffective_count=ineffective_count+excluded.ineffective_count", [key + tuple(item) for key, item in merged.items()])
                         deleted = self.db.execute("DELETE FROM episodes WHERE id BETWEEN ? AND ?", (first_id, last_id)).rowcount
                         if deleted != len(rows):
                             raise RuntimeError("操作经验归档数量不一致")
@@ -1116,9 +1478,11 @@ class MemoryStore:
                 self.db.close()
 
 
-def parse_observation(xml_text, screen_size=(480, 854)):
+def parse_observation(xml_text, screen_size=(480, 854), expected_input=None):
     document = ET.fromstring(xml_text)
     all_nodes = []
+    expected_input = expected_input if isinstance(expected_input, str) and expected_input else None
+    input_matches = set()
     for node in document.iter("node"):
         attrs = node.attrib
         match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", ""))
@@ -1136,7 +1500,10 @@ def parse_observation(xml_text, screen_size=(480, 854)):
         editable = "EditText" in attrs.get("class", "")
         if not text and not description and not interactive and not editable:
             continue
-        all_nodes.append({"id": len(all_nodes), "text": text[:240], "description": description[:240], "class": attrs.get("class", ""), "resource": attrs.get("resource-id", ""), "package": attrs.get("package", ""), "bounds": bounds, "clickable": attrs.get("clickable") == "true", "long_clickable": attrs.get("long-clickable") == "true", "editable": editable, "scrollable": attrs.get("scrollable") == "true", "enabled": attrs.get("enabled", "true") == "true", "checkable": attrs.get("checkable") == "true", "checked": attrs.get("checked") == "true", "selected": attrs.get("selected") == "true", "focused": attrs.get("focused") == "true"})
+        node_id = len(all_nodes)
+        if expected_input is not None and editable and attrs.get("password") != "true" and expected_input in text:
+            input_matches.add(node_id)
+        all_nodes.append({"id": node_id, "text": text[:240], "description": description[:240], "class": attrs.get("class", ""), "resource": attrs.get("resource-id", ""), "package": attrs.get("package", ""), "bounds": bounds, "clickable": attrs.get("clickable") == "true", "long_clickable": attrs.get("long-clickable") == "true", "editable": editable, "scrollable": attrs.get("scrollable") == "true", "enabled": attrs.get("enabled", "true") == "true", "checkable": attrs.get("checkable") == "true", "checked": attrs.get("checked") == "true", "selected": attrs.get("selected") == "true", "focused": attrs.get("focused") == "true"})
     structural = []
     content = []
     for node in all_nodes:
@@ -1160,6 +1527,10 @@ def parse_observation(xml_text, screen_size=(480, 854)):
         label = (node["text"] + " " + node["description"]).strip()
         features = "/".join(name for name, flag in (("可点", node["clickable"]), ("长按", node["long_clickable"]), ("输入", node["editable"]), ("滚动", node["scrollable"]), ("开启" if node["checked"] else "关闭", node["checkable"]), ("已选", node["selected"]), ("焦点", node["focused"])) if flag)
         summary_lines.append(f"{node['id']} {node['package']} {label} {features} {node['bounds']}")
+    if expected_input is not None:
+        for node in all_nodes:
+            if node["editable"]:
+                node["_expected_match"] = node["id"] in input_matches
     return {"state": fingerprint, "content_state": content_fingerprint, "nodes": all_nodes, "summary": "\n".join(summary_lines), "size": list(screen_size)}
 
 
@@ -1708,11 +2079,44 @@ class LocalAI:
         finally:
             self._call_lock.release()
 
+    @staticmethod
+    def _shrink_plan_prompt(content, desired_length):
+        pattern = r"(?m)^(用户目标|已有经验|当前控件的历史验证经验|最近操作|当前截图离线视觉观察|当前界面控件)：\n"
+        found = list(re.finditer(pattern, content))
+        if len(found) != 6:
+            return content
+        parts = {}
+        for index, match in enumerate(found):
+            end = found[index + 1].start() if index + 1 < len(found) else len(content)
+            parts[match.group(1)] = content[match.end():end].rstrip("\n")
+        suffix = "\n请选择下一步动作。"
+        if parts["当前界面控件"].endswith(suffix.strip()):
+            parts["当前界面控件"] = parts["当前界面控件"][:-len(suffix.strip())].rstrip("\n")
+        floors = {"已有经验": 0, "当前控件的历史验证经验": 0, "当前截图离线视觉观察": 0, "最近操作": 180, "当前界面控件": 1100, "用户目标": 300}
+        priority = ("已有经验", "当前控件的历史验证经验", "当前截图离线视觉观察", "最近操作", "当前界面控件", "用户目标")
+        remaining = max(0, len(content) - max(400, desired_length))
+        for name in priority:
+            current = parts[name]
+            removable = max(0, len(current) - floors[name])
+            if not removable or remaining <= 0:
+                continue
+            removed = min(removable, remaining)
+            new_length = len(current) - removed
+            if name == "最近操作":
+                parts[name] = current[-new_length:] if new_length else ""
+            else:
+                parts[name] = current[:new_length]
+                if name == "当前界面控件" and "\n" in parts[name] and len(parts[name]) < len(current):
+                    parts[name] = parts[name].rsplit("\n", 1)[0]
+            remaining -= removed
+        return "".join(match.group(0) + parts[match.group(1)] + "\n" for match in found) + suffix.strip()
+
     def _fit_messages(self, messages, max_tokens, cancel):
         fitted = [dict(message) for message in messages]
         budget = 4096 - max_tokens - 128
-        for _ in range(9):
+        for _ in range(8):
             self._check(cancel)
+            self.status("本地 AI 正在检查输入长度")
             template = self._request("/apply-template", {"messages": fitted}, cancel=cancel, timeout=15)
             prompt = template.get("prompt")
             if not isinstance(prompt, str):
@@ -1728,9 +2132,14 @@ class LocalAI:
                 break
             target = max(candidates, key=lambda message: len(message["content"]))
             content = target["content"]
-            keep = int(len(content) * min(0.8, budget / len(tokens) * 0.8))
+            keep = int(len(content) * min(0.84, budget / len(tokens) * 0.88))
             if keep < 120:
                 break
+            if "当前界面控件：\n" in content:
+                trimmed = self._shrink_plan_prompt(content, keep)
+                if trimmed != content:
+                    target["content"] = trimmed
+                    continue
             front = int(keep * 0.65)
             target["content"] = content[:front] + "\n…\n" + content[-(keep - front):]
         raise RuntimeError("当前输入超过离线 AI 的上下文容量")
@@ -2402,7 +2811,7 @@ class AndroidRuntime:
                 self.gpu_mode = "software"
                 self.log("android_exit", code=self.process.returncode, retry=self._failures)
             self._launch(cancel)
-            self._wait_for_device(cancel, seconds=180 if self.acceleration == "off" else 70)
+            self._wait_for_device(cancel, seconds=480 if self.acceleration == "off" else 70)
         deadline = time.monotonic() + (1200 if self.acceleration == "off" else 360)
         last_status = 0.0
         while time.monotonic() < deadline:
@@ -2650,7 +3059,9 @@ def action_effect(before, action, after):
         targeted = next((node for node in prior if node.get("editable") and x is not None and y is not None and len(node.get("bounds", [])) == 4 and node["bounds"][0] <= x < node["bounds"][2] and node["bounds"][1] <= y < node["bounds"][3]), None)
         def visible(nodes):
             for node in nodes:
-                if not node.get("editable") or expected not in str(node.get("text", "")):
+                if not node.get("editable"):
+                    continue
+                if node.get("_expected_match") is not True and expected not in str(node.get("text", "")):
                     continue
                 if x is None or y is None:
                     return True
@@ -2685,9 +3096,11 @@ def input_goal_complete(goal, action, effect_basis):
         return False
     text = re.sub(r"\s+", "", str(action.get("text", "")).lower())
     goal = re.sub(r"\s+", "", str(goal).lower())
-    if not text or len(goal) > 200 or text not in goal:
+    if not text or text not in goal:
         return False
     instruction = goal.replace(text, "", 1)
+    if len(instruction) > 160:
+        return False
     if not re.search(r"输入(?!框|法)|填入|填写|键入|写入|\btype\b|\benter\b|\bfill\b", instruction):
         return False
     if re.search(r"然后|之后|随后|接着|再(按|点|输|发|搜|打开|关闭|保|跳|执行)|并|同时|提交|发送|搜索(?!框)|登录(?!页|界面|框)|注册|保存|点击|确认|以及|最后|打开|启动|安装|完成后|学习|探索|如何|教程|研究", instruction):
@@ -2698,7 +3111,9 @@ def input_goal_complete(goal, action, effect_basis):
 def action_outcome(goal, before, action, after, visits, history=(), judgment=None, identity_key=None, submitted=True):
     structural_changed = before["state"] != after["state"]
     content_changed = before.get("content_state", before["state"]) != after.get("content_state", after["state"])
-    visual_changed = bool(before.get("image_signature") and after.get("image_signature") and before["image_signature"] != after["image_signature"])
+    coarse_visual_changed = bool(before.get("image_signature") and after.get("image_signature") and before["image_signature"] != after["image_signature"])
+    fine_visual_changed = bool(before.get("image_exact_signature") and after.get("image_exact_signature") and before["image_exact_signature"] != after["image_exact_signature"])
+    visual_changed = coarse_visual_changed or fine_visual_changed
     changed = structural_changed or content_changed or visual_changed
     relevance = goal_evidence(goal, before, after)
     packed_action = persistent_action(action, identity_key)
@@ -2762,7 +3177,7 @@ def action_outcome(goal, before, action, after, visits, history=(), judgment=Non
             reward -= min(0.45, stagnation * 0.15)
         if cycles:
             reward -= min(0.4, cycles * 0.12)
-    result = {"screen_changed": changed, "structural_changed": structural_changed, "content_changed": content_changed, "visual_changed": visual_changed, "new_state": bool((structural_changed or visual_changed) and visits == 0), "observed_state": learning_state(after), "structural_state": after["state"], "goal_relevance": relevance, "goal_progress_clue": bool(changed and relevance["improved"]), "goal_progress_observed": progress_verified or success_verified, "effect_observed": effect_observed, "effect_basis": effect_basis, "task_success_verified": success_verified, "task_success_basis": ("input_text_verified" if input_completed else "confirmed_visible_evidence" if success_verified else "unverified"), "goal_evidence_text": quote if grounded else "", "verification": verification, "repeated_ineffective_action": stagnation if not changed else 0, "repeated_transition": cycles}
+    result = {"screen_changed": changed, "structural_changed": structural_changed, "content_changed": content_changed, "visual_changed": visual_changed, "fine_visual_changed": fine_visual_changed, "fine_only_visual_change": fine_visual_changed and not coarse_visual_changed, "new_state": bool((structural_changed or visual_changed) and visits == 0), "observed_state": learning_state(after), "structural_state": after["state"], "goal_relevance": relevance, "goal_progress_clue": bool(changed and relevance["improved"]), "goal_progress_observed": progress_verified or success_verified, "effect_observed": effect_observed, "effect_basis": effect_basis, "task_success_verified": success_verified, "task_success_basis": ("input_text_verified" if input_completed else "confirmed_visible_evidence" if success_verified else "unverified"), "goal_evidence_text": quote if grounded else "", "verification": verification, "repeated_ineffective_action": stagnation if not changed else 0, "repeated_transition": cycles}
     return round(reward, 4), result
 
 
@@ -2770,12 +3185,16 @@ def stall_limit(phase, acceleration=None):
     phase = str(phase or "")
     if "prepare" in phase:
         return 1500
-    if phase.startswith(("android_start", "recovering_")):
-        return 1300 if phase == "android_start" and acceleration == "off" else 420
+    if phase == "android_start":
+        return 1300 if acceleration == "off" else 480
+    if phase.startswith("recovering_"):
+        return 480
+    if phase.startswith(("plan", "judge", "reflect", "ai")):
+        return 780
+    if phase.startswith(("vision", "offline_verify")):
+        return 600
     if phase.startswith(("observe", "act", "storage", "confirm")):
-        return 150
-    if phase.startswith(("plan", "judge", "reflect", "vision", "ai")):
-        return 330
+        return 180
     return 480
 
 
@@ -2951,7 +3370,7 @@ def supervisor_process(root, initial_pid):
                     stale = time.time() - float(snapshot.get("heartbeat", 0))
                     inactive = float(snapshot.get("progress_age_seconds", 0))
                     allowed = stall_limit(snapshot.get("phase"), snapshot.get("acceleration")) + 140
-                    if stale > 50 or (stale >= 5 and inactive > allowed):
+                    if stale > 50 or inactive > allowed:
                         reason = "heartbeat_stalled" if stale > 50 else "worker_unresponsive"
                         if not terminate_identified_process(pid, token):
                             time.sleep(5)
@@ -3014,11 +3433,13 @@ class Controller:
         self.shutdown = threading.Event()
         self.lifecycle = threading.RLock()
         self.action_lock = threading.RLock()
+        self.manual_pending = 0
         self.model_lock = threading.RLock()
         self.frame_lock = threading.Lock()
         self.frame = None
         self.frame_number = 0
         self.last_observation = None
+        self.capture_record = None
         self.last_episode = None
         self.goal = str(self.memory.get("goal", "探索安卓中的应用和界面，学习它们的操作方式，记录可验证的发现，持续寻找新知识。"))
         self.worker = None
@@ -3032,6 +3453,14 @@ class Controller:
         self.android_ready = False
         self.assets_ready = False
         self.operational_ready = False
+        self.stack_verified = {"android": False, "ai": False, "vision": False}
+        self.prepared_announced = False
+        self._next_stack_verify = 0.0
+        self._next_optional_vision_verify = time.monotonic()
+        self._next_sequential_vision = 0.0
+        self.component_retry = {"ai": {"failures": 0, "after": 0.0}, "vision": {"failures": 0, "after": 0.0}}
+        self._intent_dirty = False
+        self._intent_next_retry = 0.0
         self.ui_epoch = 0
         self.exporting = False
         self.chat_busy = False
@@ -3062,6 +3491,8 @@ class Controller:
         self.frame_timings = collections.deque(maxlen=60)
         self._last_frame_hash = None
         self.idle_visual_steps = 0
+        self._visual_only_recent = False
+        self.visual_mismatch_count = 0
         self.completed_steps = 0
         self.log_thread = threading.Thread(target=self._write_logs, daemon=True, name="EventWriter")
         self.log_thread.start()
@@ -3111,6 +3542,9 @@ class Controller:
         while not self.shutdown.wait(3):
             try:
                 self._write_supervisor_state()
+                if self._intent_dirty and time.monotonic() >= self._intent_next_retry:
+                    with self.lifecycle:
+                        self._persist_run_intent(self.desired_running or self.resume_requested)
                 if not self.supervised_child and self.supervisor_process_handle is not None and self.supervisor_process_handle.poll() is not None:
                     self.log("supervisor_error", error="独立监督进程已退出，正在重新启动")
                     self._launch_supervisor()
@@ -3171,6 +3605,34 @@ class Controller:
         total, available = system_memory_mb()
         return runtime_resource_budget(total, available, os.cpu_count(), ai_loaded=self.ai.alive(), vision_loaded=self.vision.alive())["parallel_vision"]
 
+    def _component_available(self, component):
+        return time.monotonic() >= self.component_retry[component]["after"]
+
+    def _component_failed(self, component, error):
+        state = self.component_retry[component]
+        state["failures"] += 1
+        delay = min(120.0, float(2 ** min(7, state["failures"])))
+        state["after"] = time.monotonic() + delay
+        self.stack_verified[component] = False
+        if component == "ai":
+            self.operational_ready = False
+        self.log("component_degraded", component=component, failures=state["failures"], retry_seconds=delay, error=str(error)[:350])
+
+    def _component_recovered(self, component):
+        state = self.component_retry[component]
+        if state["failures"]:
+            self.log("component_recovered", component=component, previous_failures=state["failures"])
+        state["failures"] = 0
+        state["after"] = 0.0
+
+    def _publish_capture(self, observation, png):
+        with self.frame_lock:
+            self.last_observation = observation
+            if png is not None:
+                self.frame = png
+                self.frame_number += 1
+                self.capture_record = {"observation": dict(observation), "png": png, "captured_at": utc_now(), "number": self.frame_number}
+
     def _force_recover(self, generation):
         with self.lifecycle:
             if self.generation != generation or not self.desired_running or self.shutdown.is_set():
@@ -3185,12 +3647,34 @@ class Controller:
             self.android.force_recycle()
             self.android_ready = False
             self.operational_ready = False
+            self.stack_verified["android"] = False
         self.log("watchdog_process_recycled", generation=generation)
 
     def _heartbeat(self, phase):
         with self.progress_lock:
             self.last_progress = time.monotonic()
             self.progress_phase = str(phase)
+
+    def operation_state(self):
+        with self.lifecycle:
+            if self.shutdown.is_set():
+                return "STOPPING"
+            if not self.desired_running and not self.resume_requested:
+                if self.worker is not None and self.worker.is_alive():
+                    return "STOPPING"
+                return "STOPPED"
+            with self.progress_lock:
+                phase = self.progress_phase
+            if phase.startswith("recovering_") or (self.run_cancel is not None and self.run_cancel.is_set()):
+                return "RECOVERING"
+            return "RUNNING"
+
+    def manual_authorized(self):
+        with self.lifecycle:
+            return (not self.shutdown.is_set()
+                    and not self.desired_running
+                    and not self.resume_requested
+                    and (self.worker is None or not self.worker.is_alive()))
 
     def _watchdog(self):
         while not self.shutdown.wait(10.0):
@@ -3240,6 +3724,8 @@ class Controller:
             saved = True
         except Exception as exc:
             errors.append("数据库运行状态：" + str(exc))
+        self._intent_dirty = bool(errors)
+        self._intent_next_retry = time.monotonic() + 15.0 if errors else 0.0
         if errors:
             self.log("run_intent_persistence_error", running=running, saved=saved, errors=errors)
             self.events.put(("storage_error", "；".join(errors)[:300]))
@@ -3257,7 +3743,9 @@ class Controller:
                 return
             self.goal = new_goal
             self.memory.set("goal", new_goal)
-            self._persist_run_intent(True)
+            stored = self._persist_run_intent(True)
+            if not stored:
+                self.status("运行状态暂时无法持久化；异常退出后的自动恢复可能受影响")
             self.resume_requested = False
             self.ui_epoch += 1
             self.desired_running = True
@@ -3287,7 +3775,9 @@ class Controller:
                 self.run_cancel.set()
             if self.chat_cancel is not None:
                 self.chat_cancel.set()
-            self._persist_run_intent(False)
+            stored = self._persist_run_intent(False)
+            if not stored:
+                self.events.put(("storage_error", "停止请求已生效，但未能保存停止状态；请检查工作文件夹的写入权限与磁盘空间"))
             with contextlib.suppress(OSError, ValueError):
                 self._write_supervisor_state()
             worker_running = self.worker is not None and self.worker.is_alive()
@@ -3314,6 +3804,7 @@ class Controller:
     def _run(self, generation, cancel):
         failures = collections.Counter()
         history = collections.deque(maxlen=12)
+        active_goal = self.goal
         try:
             try:
                 self.memory.set("goal", self.goal)
@@ -3329,35 +3820,68 @@ class Controller:
             while not cancel.is_set() and not self.shutdown.is_set():
                 try:
                     check_cancel(cancel)
+                    if active_goal != self.goal:
+                        active_goal = self.goal
+                        history.clear()
+                        self.steps_since_reflection = 0
+                        self.visual_mismatch_count = 0
+                        self._visual_only_recent = False
+                        self.log("goal_context_reset", goal_length=len(active_goal))
                     if not self.assets_ready:
                         self._heartbeat("android_prepare")
                         self.status("正在准备运行环境；准备完成后自动开始")
                         self.android.prepare(cancel)
-                        self._heartbeat("ai_prepare")
-                        self.ai.prepare(cancel)
-                        self._heartbeat("vision_prepare")
-                        self.vision.prepare(cancel)
+                        for name, engine in (("ai", self.ai), ("vision", self.vision)):
+                            if not self._component_available(name):
+                                continue
+                            self._heartbeat(name + "_prepare")
+                            try:
+                                with acquired(self.model_lock, cancel):
+                                    engine.prepare(cancel)
+                                self._component_recovered(name)
+                            except Cancelled:
+                                raise
+                            except Exception as exc:
+                                self._component_failed(name, exc)
                         self.assets_ready = True
                     self._heartbeat("android_start")
                     with acquired(self.action_lock, cancel):
                         self._update_resource_budget(require_android=not self.android.booted)
                         self.android.ensure_running(cancel)
                         self.android_ready = True
-                    self._heartbeat("ai_start")
-                    with acquired(self.model_lock, cancel):
-                        self.ai.start(cancel)
-                    if not self.operational_ready:
+                    with self.lifecycle:
+                        manual_inflight = self.manual_pending > 0
+                    if manual_inflight:
+                        self._heartbeat("waiting_manual_handover")
+                        self.status("正在等待之前发起的手动操作结束，随后由 AI 接管")
+                        if cancel.wait(0.25):
+                            raise Cancelled()
+                        continue
+                    if not all(self.stack_verified.values()) and time.monotonic() >= self._next_stack_verify:
                         self._heartbeat("offline_verify")
-                        self.status("正在验证安卓画面、本地推理与离线视觉")
-                        self._verify_offline_stack(cancel)
-                        self.operational_ready = True
+                        self.status("正在验证尚未就绪的本地组件")
+                        verify_vision = not self.stack_verified["vision"] and self._component_available("vision") and time.monotonic() >= self._next_optional_vision_verify
+                        if verify_vision:
+                            self._next_optional_vision_verify = time.monotonic() + 60.0
+                        capabilities = self._verify_offline_stack(cancel, verify_vision=verify_vision)
+                        self.operational_ready = capabilities["android"] and capabilities["ai"]
+                        self._next_stack_verify = time.monotonic() + 8.0
+                    if all(self.stack_verified.values()) and not self.prepared_announced:
                         self.memory.set("prepared_at", utc_now())
                         self.events.put(("prepared", True))
+                        self.prepared_announced = True
+                    if not self.operational_ready:
+                        self._heartbeat("recovering_ai")
+                        self.status("离线 AI 尚未通过可用性验证，正在自动恢复")
+                        if cancel.wait(0.4):
+                            raise Cancelled()
+                        continue
                     self._heartbeat("observe_plan_act")
                     self._step(cancel, history)
                     self.completed_steps += 1
                     if self.completed_steps % 25 == 0:
                         self.log("learning_quality", **self.memory.experience_quality())
+                        self.log("goal_learning_quality", **self.memory.goal_quality(self.goal))
                         self.log("runtime_performance", planning_seconds=round(sum(self.planning_timings) / len(self.planning_timings), 3) if self.planning_timings else None, vision_seconds=round(sum(self.visual_timings) / len(self.visual_timings), 3) if self.visual_timings else None, frame_seconds=round(sum(self.frame_timings) / len(self.frame_timings), 3) if self.frame_timings else None, event_queue=self.events.qsize() if hasattr(self.events, "qsize") else None)
                     if self.completed_steps % 200 == 0:
                         self._heartbeat("storage_maintenance")
@@ -3383,8 +3907,6 @@ class Controller:
                         component = "ai"
                     elif phase.startswith(("memory", "storage")):
                         component = "storage"
-                    elif isinstance(exc, ComponentFailure) and exc.component == "resources":
-                        component = "resources"
                     else:
                         component = "unknown"
                     failures[component] += 1
@@ -3397,6 +3919,7 @@ class Controller:
                             self.android._stop_emulator()
                             self.android_ready = False
                             self.operational_ready = False
+                            self.stack_verified["android"] = False
                         self.log("android_recovery_restart", failed_attempts=count)
                     elif component == "ai":
                         with acquired(self.model_lock, cancel):
@@ -3435,61 +3958,94 @@ class Controller:
                         if not self.shutdown.is_set():
                             self.status("AI 已停止；安卓可继续手动操作")
 
-    def _verify_offline_stack(self, cancel):
-        with acquired(self.model_lock, cancel):
-            answer = self.ai._complete([{"role": "user", "content": "用一句话说明你已准备好。"}], cancel=cancel, max_tokens=48)
-        with acquired(self.action_lock, cancel):
-            png = self.android.screenshot(cancel)
-            observation = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
+    def _verify_offline_stack(self, cancel, verify_vision=False):
         with self.frame_lock:
-            self.frame = png
-            self.frame_number += 1
-            self.last_observation = observation
+            capture = self.capture_record if self.stack_verified["android"] else None
+        if capture is not None:
+            observation = capture["observation"]
+            png = capture["png"]
+        else:
+            with acquired(self.action_lock, cancel):
+                observation = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
+                png = self.android.screenshot(cancel)
+                stamp_screenshot(observation, png)
+            self._publish_capture(observation, png)
+        self.stack_verified["android"] = True
+        answer = ""
+        if not self.stack_verified["ai"] and self._component_available("ai"):
+            try:
+                self._heartbeat("ai_verify")
+                with acquired(self.model_lock, cancel):
+                    if self.vision.alive() and not self._can_parallel_vision():
+                        self.vision.stop()
+                    answer = self.ai._complete([{"role": "user", "content": "用一句话说明你已准备好。"}], cancel=cancel, max_tokens=48)
+                self.stack_verified["ai"] = bool(answer)
+                self._component_recovered("ai")
+            except Cancelled:
+                raise
+            except Exception as exc:
+                self._component_failed("ai", exc)
         description = ""
-        try:
-            with acquired(self.model_lock, cancel):
-                self.ai.stop()
+        if verify_vision and not self.stack_verified["vision"] and self._component_available("vision"):
+            try:
                 self._heartbeat("vision_verify")
-                description = self.vision.inspect(png, self.goal, observation["size"], cancel=cancel)
-        except Cancelled:
-            raise
-        except Exception as exc:
-            self.log("vision_verification_error", error=str(exc))
-            raise ComponentFailure("vision", exc) from exc
-        self.log("offline_stack_verified", ai_answer=answer[:100], screenshot_bytes=len(png), nodes=len(observation["nodes"]), vision_characters=len(description))
+                with acquired(self.model_lock, cancel):
+                    if not self._can_parallel_vision():
+                        self.ai.stop()
+                    description = self.vision.inspect(png, self.goal, observation["size"], cancel=cancel)
+                self.stack_verified["vision"] = bool(description)
+                self._component_recovered("vision")
+            except Cancelled:
+                raise
+            except Exception as exc:
+                self._component_failed("vision", exc)
+        self.operational_ready = self.stack_verified["android"] and self.stack_verified["ai"]
+        self.log("offline_stack_verified", **self.stack_verified, ai_answer=answer[:100], screenshot_bytes=len(png), nodes=len(observation["nodes"]), vision_characters=len(description))
+        return dict(self.stack_verified)
 
     def _observe(self, cancel):
         self._heartbeat("observe_android")
         with acquired(self.action_lock, cancel):
             xml_text = self.android.hierarchy(cancel)
             observation = parse_observation(xml_text, self.android.screen_size())
-        with self.frame_lock:
-            self.last_observation = observation
+            png = self.android.screenshot(cancel)
+            stamp_screenshot(observation, png)
+        self._publish_capture(observation, png)
         return observation
 
-    @staticmethod
-    def _needs_vision(observation, history):
+    def _needs_vision(self, observation, history):
         nodes = observation.get("nodes", [])
         active = [node for node in nodes if node.get("enabled") and (node.get("clickable") or node.get("editable") or node.get("scrollable"))]
         labeled = [node for node in active if (node.get("text") or node.get("description"))]
         repeated = sum(1 for item in history if item.get("state") == learning_state(observation) and item.get("observed", {}).get("screen_changed") is False)
-        return not active or (len(labeled) == 0 and len(active) < 4) or repeated >= 2
+        unlabeled_ratio = 1.0 - len(labeled) / len(active) if active else 1.0
+        return not active or unlabeled_ratio >= 0.5 or repeated >= 2 or self._visual_only_recent or (self.completed_steps > 0 and self.completed_steps % 40 == 0)
 
     def _visual_observation(self, observation, goal, history, cancel):
+        visual_key = observation.get("image_signature")
+        exact_key = observation.get("image_exact_signature")
         if not self._needs_vision(observation, history):
-            return "", None
+            return "", visual_key, exact_key
         signature = (observation["state"], observation["content_state"])
         self._heartbeat("vision_capture")
         with acquired(self.action_lock, cancel):
             current = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
             if (current["state"], current["content_state"]) != signature:
-                return "", None
+                return "", visual_key, exact_key
             png = self.android.screenshot(cancel)
-        visual_key = screenshot_signature(png)
+        fingerprints = screenshot_fingerprints(png)
+        visual_key, exact_key = fingerprints["perceptual"], fingerprints["exact"]
         cache_key = signature + (visual_key, hashlib.sha256(str(goal).encode("utf-8")).hexdigest()[:16])
         if cache_key in self.visual_cache:
             self.visual_cache.move_to_end(cache_key)
-            return self.visual_cache[cache_key], visual_key
+            return self.visual_cache[cache_key], visual_key, exact_key
+        if not self._component_available("vision"):
+            return "", visual_key, exact_key
+        parallel = self._can_parallel_vision()
+        if not parallel:
+            if time.monotonic() < self._next_sequential_vision:
+                return "", visual_key, exact_key
+            self._next_sequential_vision = time.monotonic() + (90.0 if realtime_goal(goal) else 25.0)
         with acquired(self.model_lock, cancel):
             keep_loaded = self._can_parallel_vision()
             if not keep_loaded:
@@ -3498,41 +4054,72 @@ class Controller:
             started = time.monotonic()
             description = self.vision.inspect(png, goal, current["size"], cancel=cancel, keep_running=keep_loaded)
             self.visual_timings.append(round(time.monotonic() - started, 3))
+        self._component_recovered("vision")
+        self.stack_verified["vision"] = True
         self.visual_cache[cache_key] = description
         self.visual_cache.move_to_end(cache_key)
         while len(self.visual_cache) > 64:
             self.visual_cache.popitem(last=False)
         self.log("vision_observed", state=observation["state"], image_signature=visual_key, characters=len(description), seconds=self.visual_timings[-1], parallel=keep_loaded)
-        return description, visual_key
+        return description, visual_key, exact_key
 
-    def _wait_for_effect(self, before, action, cancel, epoch, goal, visual_key=None):
+    def _wait_for_effect(self, before, action, cancel, epoch, goal):
         kind = action.get("kind", "")
-        seconds = 6.0 if kind == "type" else (1.5 if kind == "wait" else 4.5)
-        deadline = time.monotonic() + seconds
+        real_time = realtime_goal(goal) and kind in {"tap", "long_press", "swipe", "drag", "back", "home", "recents", "keyevent"}
+        active = [node for node in before.get("nodes", []) if node.get("enabled") and (node.get("clickable") or node.get("editable") or node.get("scrollable"))]
+        image_first = kind != "type" and (real_time or len(active) <= 1 or self._visual_only_recent)
+        seconds = 0.9 if real_time else (6.0 if kind == "type" else (1.5 if kind == "wait" else 4.5))
+        deadline = time.monotonic() + (min(seconds, 2.0) if image_first else seconds)
         previous = None
         stable = 0
         after = None
+        last_png = None
         for attempt in range(8):
             check_cancel(cancel)
             if epoch != self.ui_epoch or goal != self.goal:
-                return None
+                return None, None
             with acquired(self.action_lock, cancel):
                 if epoch != self.ui_epoch or goal != self.goal:
-                    return None
+                    return None, None
                 self._heartbeat("observe_android")
-                after = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
-                if visual_key is not None:
-                    after["image_signature"] = screenshot_signature(self.android.screenshot(cancel))
-            signature = (after["state"], after["content_state"], after.get("image_signature"))
-            stable = stable + 1 if signature == previous else 1
-            previous = signature
-            changed = signature != (before["state"], before["content_state"], before.get("image_signature"))
-            effect, basis = action_effect(before, action, after)
-            if kind == "wait" or (changed and stable >= 2) or (effect and basis in {"input_text_visible", "toggle_state_verified"} and stable >= 2) or time.monotonic() >= deadline:
-                return after
-            if cancel.wait(min(0.4, max(0.0, deadline - time.monotonic()))):
+                if not image_first:
+                    after = parse_observation(self.android.hierarchy(cancel), self.android.screen_size(), expected_input=action.get("text") if kind == "type" else None)
+                last_png = self.android.screenshot(cancel)
+                if image_first and real_time:
+                    encoded = hashlib.sha256(last_png).hexdigest()[:24]
+                    signature = (encoded,)
+                    stable = stable + 1 if signature == previous else 1
+                    previous = signature
+                    changed = encoded != before.get("image_encoded_signature")
+                    should_finish = kind == "wait" or (changed and attempt >= 1) or time.monotonic() >= deadline or attempt == 7
+                else:
+                    fingerprints = screenshot_fingerprints(last_png)
+                    if not image_first:
+                        stamp_screenshot(after, last_png)
+                    signature = (fingerprints["perceptual"],) if image_first else (after["state"], after["content_state"], fingerprints["perceptual"])
+                    stable = stable + 1 if signature == previous else 1
+                    previous = signature
+                    fine_changed = bool(before.get("image_exact_signature") and fingerprints["exact"] != before["image_exact_signature"])
+                    if image_first:
+                        changed = fingerprints["perceptual"] != before.get("image_signature") or fine_changed
+                        should_finish = kind == "wait" or (changed and stable >= 2) or time.monotonic() >= deadline or attempt == 7
+                    else:
+                        changed = signature != (before["state"], before["content_state"], before.get("image_signature")) or fine_changed
+                        effect, basis = action_effect(before, action, after)
+                        should_finish = kind == "wait" or (changed and stable >= 2) or (effect and basis in {"input_text_visible", "toggle_state_verified"} and stable >= 2) or time.monotonic() >= deadline or attempt == 7
+            if should_finish:
+                if image_first:
+                    with acquired(self.action_lock, cancel):
+                        if epoch != self.ui_epoch or goal != self.goal:
+                            return None, None
+                        after = parse_observation(self.android.hierarchy(cancel), self.android.screen_size(), expected_input=action.get("text") if kind == "type" else None)
+                        last_png = self.android.screenshot(cancel)
+                        stamp_screenshot(after, last_png)
+                return after, last_png
+            delay = 0.12 if real_time else (0.18 if image_first else 0.4)
+            if cancel.wait(min(delay, max(0.0, deadline - time.monotonic()))):
                 raise Cancelled()
-        return after
+        return after, last_png
 
     def _experience_hints(self, goal, observation, limit=10):
         guidance = self.memory.action_guidance(goal, observation)
@@ -3544,15 +4131,20 @@ class Controller:
             key = self.memory._node_key(node)
             if key is None:
                 continue
+            label = (str(node.get("text", "")) + " " + str(node.get("description", ""))).strip()[:160]
+            semantic = self.memory._semantic_key(label)
             for kind, available in (("tap", node.get("clickable")), ("long_press", node.get("long_clickable"))):
                 if not available:
                     continue
                 average, samples = guidance.get((key, kind), (0.0, 0))
+                match_basis = "same_control"
+                if not samples and semantic is not None:
+                    average, samples = guidance.get((semantic, kind), (0.0, 0))
+                    match_basis = "similar_label"
                 attempts = coverage.get((key, kind), 0)
                 if not samples and not attempts:
                     continue
-                label = (str(node.get("text", "")) + " " + str(node.get("description", ""))).strip()[:60]
-                hints.append({"target": node["id"], "kind": kind, "label": label, "context_samples": samples, "historical_attempts": attempts, "context_score": round(average, 3) if samples else None})
+                hints.append({"target": node["id"], "kind": kind, "label": label[:60], "context_samples": samples, "historical_attempts": attempts, "context_score": round(average, 3) if samples else None, "match_basis": match_basis})
         hints.sort(key=lambda item: (item["context_samples"] > 0, abs(item["context_score"] or 0), item["historical_attempts"]), reverse=True)
         return json.dumps(hints[:limit], ensure_ascii=False, separators=(",", ":"))
 
@@ -3560,6 +4152,7 @@ class Controller:
         state = learning_state(observation)
         guidance = self.memory.action_guidance(goal, observation)
         coverage = self.memory.action_coverage(observation)
+        replay = self.memory.state_action_stats(goal, observation)
         attempted = {}
         for entry in history:
             if entry.get("state") != state:
@@ -3588,9 +4181,17 @@ class Controller:
                     continue
                 key = self.memory._node_key(node)
                 experience, samples = guidance.get((key, kind), (0.0, 0))
+                if not samples:
+                    semantic = self.memory._semantic_key(label)
+                    if semantic is not None:
+                        experience, samples = guidance.get((semantic, kind), (0.0, 0))
+                past = replay.get((key, kind), {})
                 score = match * 2.4 + (0.6 if label.strip() else 0.0) + (0.4 if kind == "tap" else 0.2)
                 score += min(2.0, max(-2.0, experience * 2.0)) * min(1.0, samples / 3.0)
                 score -= min(1.8, math.log1p(coverage.get((key, kind), 0)) * 0.45)
+                score -= min(3.5, math.log1p(past.get("ineffective", 0)) * 1.4)
+                score -= min(4.0, math.log1p(past.get("failures", 0)) * 2.0)
+                score += min(0.8, math.log1p(past.get("successes", 0)) * 0.3)
                 if coverage.get((key, kind), 0) == 0:
                     score += 0.65
                 candidates.append((score, -node["id"], node, kind))
@@ -3602,29 +4203,35 @@ class Controller:
             width, height = observation["size"]
             return {"kind": "swipe", "x": width // 2, "y": height * 3 // 4, "x2": width // 2, "y2": height // 3, "ms": 450, "note": "查看尚未观察到的可滚动内容"}
         self.fallback_count += 1
-        return {"kind": ("back", "home", "recents")[self.fallback_count % 3], "note": "跳出重复状态，继续探索"}
+        navigation = ("back", "home", "recents")
+        ineffective = collections.Counter(entry.get("action", {}).get("kind") for entry in history if entry.get("state") == state and entry.get("observed", {}).get("screen_changed") is False)
+        minimum = min(ineffective[kind] for kind in navigation)
+        choices = [kind for kind in navigation if ineffective[kind] == minimum]
+        kind = choices[(self.fallback_count - 1) % len(choices)]
+        return {"kind": kind, "note": "根据最近操作结果离开重复界面，继续探索"}
 
     def _confirm_completion(self, before, after, judgment, cancel, epoch, goal):
         quote = str(judgment.get("evidence", "")).strip()
         if len(quote) < 2:
-            return False, after
+            return False, after, None
         last = after
+        last_png = None
         stable = 0
         for _ in range(2):
             if cancel.wait(0.3):
                 raise Cancelled("完成证据复核已取消")
             with acquired(self.action_lock, cancel):
                 if epoch != self.ui_epoch or goal != self.goal:
-                    return False, last
+                    return False, last, last_png
                 current = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
-                if before.get("image_signature"):
-                    current["image_signature"] = screenshot_signature(self.android.screenshot(cancel))
+                last_png = self.android.screenshot(cancel)
+                stamp_screenshot(current, last_png)
             labels = (str(node.get("text", "")) + " " + str(node.get("description", "")) for node in current.get("nodes", []) if not node.get("editable"))
             if not any(quote in label for label in labels):
-                return False, current
+                return False, current, last_png
             stable = stable + 1 if (last["state"], last["content_state"]) == (current["state"], current["content_state"]) else 0
             last = current
-        return stable >= 1, last
+        return stable >= 1, last, last_png
 
     def _reconcile_inflight(self, pending, observation, history):
         if not isinstance(pending, list):
@@ -3638,15 +4245,19 @@ class Controller:
             before = before if isinstance(before, dict) else {}
             original_state = str(before.get("state", previous.get("state", "")))
             original_content = str(before.get("content_state", ""))
-            submitted = previous.get("phase") == "submitted"
-            after_differs = submitted and (bool(original_state and original_state != observation.get("state")) or bool(original_content and original_content != observation.get("content_state")))
+            phase = previous.get("phase", "unknown")
+            possibly_submitted = phase in {"dispatching", "submitted", "unverified_after_error"}
+            if phase == "prepared":
+                self.log("action_prepared_not_dispatched", action_id=action_id)
+                continue
+            after_differs = possibly_submitted and (bool(original_state and original_state != observation.get("state")) or bool(original_content and original_content != observation.get("content_state")) or bool(before.get("image_signature") and observation.get("image_signature") and before["image_signature"] != observation["image_signature"]) or bool(before.get("image_exact_signature") and observation.get("image_exact_signature") and before["image_exact_signature"] != observation["image_exact_signature"]))
             target = previous.get("target_node")
             toggle_observed = False
-            if submitted and isinstance(target, dict) and target.get("checkable"):
+            if possibly_submitted and isinstance(target, dict) and target.get("checkable"):
                 node = next((item for item in observation.get("nodes", []) if item.get("resource") == target.get("resource") and item.get("package") == target.get("package") and item.get("class") == target.get("class") and (item.get("resource") or item.get("bounds") == target.get("bounds"))), None)
                 toggle_observed = bool(node is not None and node.get("checked") != target.get("checked"))
             verification = "observed_after_interruption" if after_differs or toggle_observed else "unverified_after_interruption"
-            recovered = {"verification": verification, "task_success_verified": False, "effect_observed": toggle_observed, "effect_basis": "toggle_state_after_interruption" if toggle_observed else "not_causally_verified", "screen_changed": None, "observed_state": learning_state(observation), "original_phase": previous.get("phase", "unknown"), "action_id": action_id}
+            recovered = {"verification": verification, "task_success_verified": False, "effect_observed": toggle_observed, "effect_basis": "toggle_state_after_interruption" if toggle_observed else "not_causally_verified", "screen_changed": None, "observed_state": learning_state(observation), "original_phase": phase, "possibly_submitted": possibly_submitted, "dispatch_error": str(previous.get("dispatch_error", ""))[:300], "action_id": action_id}
             historic = {"state": original_state, "action": action, "observed": recovered}
             history.append(historic)
             if not self.memory.has_action_id(action_id):
@@ -3671,26 +4282,33 @@ class Controller:
             self.memory.set("pending_recovery_actions", [])
         vision = ""
         visual_key = None
+        visual_exact = None
         try:
-            vision, visual_key = self._visual_observation(observation, goal, history, cancel)
+            vision, visual_key, visual_exact = self._visual_observation(observation, goal, history, cancel)
         except Cancelled:
             raise
         except Exception as exc:
+            self._component_failed("vision", exc)
             self.log("vision_observation_error", error=str(exc), state=observation["state"])
         check_cancel(cancel)
         if visual_key is not None:
-            observation["image_signature"] = visual_key
-            self.idle_visual_steps = 0
-        else:
-            self.idle_visual_steps += 1
-            if self.vision.alive() and (self.idle_visual_steps >= 30 or not self._can_parallel_vision()):
-                with acquired(self.model_lock, cancel):
-                    self.vision.stop()
+            if visual_key != observation["image_signature"] or (visual_exact is not None and visual_exact != observation.get("image_exact_signature")):
+                self.log("visual_updated_during_observation", old=observation["image_signature"], new=visual_key)
+                observation["image_signature"] = visual_key
+                if visual_exact is not None:
+                    observation["image_exact_signature"] = visual_exact
+                self._visual_only_recent = True
+            self.idle_visual_steps = 0 if vision else self.idle_visual_steps + 1
+        if self.vision.alive() and (self.idle_visual_steps >= 30 or not self._can_parallel_vision()):
+            with acquired(self.model_lock, cancel):
+                self.vision.stop()
         self._heartbeat("storage_recall")
         self.memory.seen(learning_state(observation))
         memory = self.memory.recall(goal, observation)
         experience = self._experience_hints(goal, observation)
         self.status("AI 正在分析当前界面")
+        if not self._component_available("ai"):
+            raise ComponentFailure("ai", "离线 AI 正在自动恢复，当前不执行无模型依据的后备操作")
         try:
             self._heartbeat("plan_ai")
             with acquired(self.model_lock, cancel):
@@ -3698,52 +4316,96 @@ class Controller:
                 plan = self.ai.plan(goal, observation["nodes"], memory=memory, history=list(history), vision=vision, experience=experience, cancel=cancel)
                 self.planning_timings.append(round(time.monotonic() - started, 3))
             action = normalize_action(plan, observation)
+            self._component_recovered("ai")
             self.plan_failures = 0
         except Cancelled:
             raise
         except (ValueError, KeyError, TypeError, RuntimeError, OSError, TimeoutError, http.client.HTTPException) as exc:
             check_cancel(cancel)
             self.plan_failures += 1
-            self.log("planner_retry", error=str(exc))
-            if isinstance(exc, (OSError, TimeoutError, http.client.HTTPException)) or self.plan_failures >= 3:
+            self.log("planner_retry", error=str(exc), consecutive=self.plan_failures)
+            if isinstance(exc, (OSError, TimeoutError, http.client.HTTPException)) or self.plan_failures >= 2:
                 with acquired(self.model_lock, cancel):
                     self.ai.stop()
+                self._component_failed("ai", exc)
                 self.plan_failures = 0
-            plan = self._fallback(observation, history, goal)
-            action = normalize_action(plan, observation)
+            raise ComponentFailure("ai", "规划结果无效，已取消本轮动作并准备重新规划：" + str(exc)[:200]) from exc
         protected = self.memory.safe_action(action)
         ineffective = sum(1 for item in history if item.get("state") == learning_state(observation) and item.get("action") == protected and item.get("observed", {}).get("screen_changed") is False)
         uncertain_verifications = {"unverified", "unverified_after_error", "unverified_after_interruption", "observed_after_interruption"}
-        uncertain_input = action["kind"] == "type" and (any(item.get("state") == learning_state(observation) and item.get("action", {}).get("kind") == "type" and item.get("action", {}).get("x") == action.get("x") and item.get("action", {}).get("y") == action.get("y") and item.get("observed", {}).get("verification") in uncertain_verifications for item in history) or self.memory.recent_unverified_input(goal, observation, action))
+        uncertain_input = action["kind"] == "type" and (any(item.get("state") == learning_state(observation) and same_input_identity(item.get("action", {}), protected) and item.get("observed", {}).get("verification") in uncertain_verifications for item in history) or self.memory.recent_unverified_input(goal, observation, action))
         uncertain_replay = any(item.get("state") == learning_state(observation) and item.get("action") == protected and item.get("observed", {}).get("verification") in uncertain_verifications for item in history)
-        if ineffective >= 2 or uncertain_input or uncertain_replay:
-            self.log("planner_stagnation", action=protected, attempts=ineffective, uncertain_input=uncertain_input, uncertain_replay=uncertain_replay)
+        long_term_stagnation = False
+        if action["kind"] in {"tap", "long_press"}:
+            target_node = self.memory._action_node(observation, action)
+            if target_node is not None:
+                key = self.memory._node_key(target_node)
+                past = self.memory.state_action_stats(goal, observation).get((key, action["kind"]), {})
+                long_term_stagnation = past.get("successes", 0) == 0 and (past.get("ineffective", 0) >= 4 or past.get("failures", 0) >= 2)
+        if ineffective >= 2 or uncertain_input or uncertain_replay or long_term_stagnation:
+            self.log("planner_stagnation", action=protected, attempts=ineffective, uncertain_input=uncertain_input, uncertain_replay=uncertain_replay, historical_stagnation=long_term_stagnation)
             plan = self._fallback(observation, history, goal)
             action = normalize_action(plan, observation)
+            if long_term_stagnation and action["kind"] == protected.get("kind") and action.get("x") == protected.get("x") and action.get("y") == protected.get("y"):
+                plan = {"kind": "back", "note": "历史操作反复无效，返回探索其他路径"}
+                action = normalize_action(plan, observation)
         check_cancel(cancel)
         with acquired(self.action_lock, cancel):
-            if epoch != self.ui_epoch or goal != self.goal:
+            if epoch != self.ui_epoch or goal != self.goal or self.manual_pending:
                 self.log("plan_refresh", reason="目标或手动操作已改变界面")
                 return
             self._heartbeat("observe_android")
-            current = parse_observation(self.android.hierarchy(cancel), self.android.screen_size())
+            current = parse_observation(self.android.hierarchy(cancel), self.android.screen_size(), expected_input=action.get("text") if action["kind"] == "type" else None)
             if (current["state"], current["content_state"]) != (observation["state"], observation["content_state"]):
                 self.log("plan_refresh", reason="界面结构或内容已经改变，重新观察")
                 return
+            if action["kind"] == "type":
+                matched_by_id = {node["id"]: node.get("_expected_match", False) for node in current["nodes"] if node.get("editable")}
+                for node in observation["nodes"]:
+                    if node.get("editable"):
+                        node["_expected_match"] = matched_by_id.get(node["id"], False)
             if visual_key is not None and screenshot_signature(self.android.screenshot(cancel)) != visual_key:
-                self.log("plan_refresh", reason="视觉识别后截图已改变，重新观察")
-                return
+                self.visual_mismatch_count += 1
+                if action["kind"] in {"tap", "long_press", "swipe", "drag", "type"}:
+                    target_id = plan.get("target")
+                    original_node = next((node for node in observation["nodes"] if node["id"] == target_id), None) if type(target_id) is int and target_id >= 0 else None
+                    current_node = next((node for node in current["nodes"] if node["id"] == target_id), None) if original_node is not None else None
+                    anchored = action["kind"] in {"tap", "long_press", "type"} and original_node is not None and current_node is not None and current_node.get("enabled") and current_node.get("bounds") == original_node.get("bounds") and current_node.get("resource") == original_node.get("resource") and current_node.get("package") == original_node.get("package")
+                    if not anchored:
+                        if self.visual_mismatch_count < 3:
+                            self.log("plan_refresh", reason="坐标操作前画面已改变，重新观察", consecutive=self.visual_mismatch_count)
+                            return
+                        alternative = self._fallback(current, history, goal)
+                        alternative_target = alternative.get("target")
+                        anchored_fallback = alternative["kind"] in {"tap", "long_press", "type"} and type(alternative_target) is int and alternative_target >= 0
+                        if not anchored_fallback and alternative["kind"] not in {"back", "home", "recents", "wait"}:
+                            alternative = {"kind": "back", "note": "动态画面无法安全定位，返回重新观察"}
+                        plan = alternative
+                        action = normalize_action(plan, current)
+                        self.log("dynamic_screen_fallback", consecutive=self.visual_mismatch_count, action=self.memory.safe_action(action))
+                    else:
+                        self.visual_mismatch_count = 0
+                else:
+                    self.log("dynamic_screen", consecutive=self.visual_mismatch_count, kind=action["kind"])
+            else:
+                self.visual_mismatch_count = 0
             self.status("AI 操作 · " + ("正在输入文字" if action["kind"] == "type" else str(plan.get("note", action["kind"]))[:140]))
             check_cancel(cancel)
             target_node = self.memory._action_node(observation, action)
             node_snapshot = None
             if target_node is not None:
                 node_snapshot = {key: target_node.get(key) for key in ("id", "package", "resource", "class", "bounds", "checkable", "checked", "enabled", "editable", "clickable", "long_clickable")}
-            snapshot = {"state": learning_state(observation), "content_state": observation.get("content_state", ""), "image_signature": observation.get("image_signature", ""), "size": observation.get("size", [480, 854]), "summary": persistent_summary(observation)[:700]}
+            snapshot = {"state": learning_state(observation), "content_state": observation.get("content_state", ""), "image_signature": observation.get("image_signature", ""), "image_exact_signature": observation.get("image_exact_signature", ""), "size": observation.get("size", [480, 854]), "summary": persistent_summary(observation)[:700]}
             intent = {"action_id": uuid.uuid4().hex, "time": utc_now(), "goal": goal, "state": learning_state(observation), "before": snapshot, "target_node": node_snapshot, "action": self.memory.safe_action(action), "phase": "prepared"}
             self._heartbeat("storage_intent")
             self.memory.set("inflight_action", intent)
             self.log("action_intent", state=observation["state"], action=self.memory.safe_action(action))
+            if epoch != self.ui_epoch or goal != self.goal or self.manual_pending:
+                self.memory.set("inflight_action", None)
+                self.log("plan_refresh", reason="执行前收到更新目标或手动操作请求")
+                return
+            intent["phase"] = "dispatching"
+            self.memory.set("inflight_action", intent)
             try:
                 self._heartbeat("act_android")
                 result = self.android.act(action, cancel)
@@ -3751,19 +4413,15 @@ class Controller:
                 raise
             except Exception as exc:
                 intent["phase"] = "unverified_after_error"
+                intent["dispatch_error"] = str(exc)[:300]
                 self.memory.set("inflight_action", intent)
-                failed = {"submitted": None, "outcome": "unverified_after_error", "verification": "unverified_after_error", "error": str(exc), "task_success_verified": False}
-                self.last_episode = self.memory.record(goal, observation, action, failed, observation, -0.05 if action.get("kind") == "type" else -0.2, action_id=intent["action_id"])
-                history.append({"state": observation["state"], "action": self.memory.safe_action(action), "observed": failed, "before": persistent_summary(observation)[:800]})
-                self.log("action_failed", episode=self.last_episode, action=self.memory.safe_action(action), error=str(exc))
-                self.memory.set("inflight_action", None)
-                self.events.put(("stats", self.memory.stats()))
+                self.log("action_unverified_after_error", action_id=intent["action_id"], action=self.memory.safe_action(action), error=str(exc))
                 raise ComponentFailure("android", exc) from exc
             intent["phase"] = "submitted"
             intent["submit_result"] = {"submitted": result.get("submitted"), "kind": result.get("kind", action["kind"])}
             self.memory.set("inflight_action", intent)
         try:
-            after = self._wait_for_effect(observation, action, cancel, epoch, goal, visual_key=visual_key)
+            after, after_png = self._wait_for_effect(observation, action, cancel, epoch, goal)
         except Cancelled:
             raise
         except Exception as exc:
@@ -3778,24 +4436,27 @@ class Controller:
             history.append({"state": learning_state(observation), "action": self.memory.safe_action(action), "observed": {"outcome": "unverified_after_manual_intervention", "screen_changed": None, "verification": "unverified_after_interruption"}})
             self.log("action_unverified", reason="目标或界面被手动操作改变")
             return
-        with self.frame_lock:
-            self.last_observation = after
+        self._publish_capture(after, after_png)
         self._heartbeat("storage_seen")
         visits = self.memory.seen(learning_state(after))
         _, preliminary = action_outcome(goal, observation, action, after, visits, history, identity_key=self.memory.action_secret)
         judgment = None
-        if preliminary["screen_changed"] or preliminary["effect_observed"]:
+        needs_judgment = preliminary["effect_observed"] or (preliminary["screen_changed"] and (not realtime_goal(goal) or preliminary["structural_changed"] or preliminary["content_changed"] or self.completed_steps % 8 == 0))
+        if needs_judgment:
             try:
                 self._heartbeat("judge_ai")
-                with acquired(self.model_lock, cancel):
-                    judgment = self.ai.judge(goal, observation, after, action, cancel=cancel)
+                if self._component_available("ai"):
+                    with acquired(self.model_lock, cancel):
+                        judgment = self.ai.judge(goal, observation, after, action, cancel=cancel)
+                    self._component_recovered("ai")
             except Cancelled:
                 raise
             except Exception as exc:
+                self._component_failed("ai", exc)
                 self.log("outcome_judgment_error", error=str(exc))
         if judgment and judgment.get("completed") is True:
             self._heartbeat("confirm_goal")
-            confirmed, checked = self._confirm_completion(observation, after, judgment, cancel, epoch, goal)
+            confirmed, checked, checked_png = self._confirm_completion(observation, after, judgment, cancel, epoch, goal)
             if not confirmed:
                 judgment["completed"] = False
                 judgment["reason"] = str(judgment.get("reason", ""))[:180] + "；完成证据在复查后未稳定出现"
@@ -3803,8 +4464,8 @@ class Controller:
                 if learning_state(checked) != learning_state(after):
                     visits = self.memory.seen(learning_state(checked))
                 after = checked
-                with self.frame_lock:
-                    self.last_observation = after
+                after_png = checked_png if checked_png is not None else after_png
+                self._publish_capture(after, after_png)
         if epoch != self.ui_epoch or goal != self.goal:
             pending = self.memory.get("pending_recovery_actions", [])
             pending = pending if isinstance(pending, list) else []
@@ -3815,6 +4476,7 @@ class Controller:
             return
         reward, evidence = action_outcome(goal, observation, action, after, visits, history, judgment=judgment, identity_key=self.memory.action_secret, submitted=result.get("submitted"))
         result.update(evidence)
+        self._visual_only_recent = bool(evidence["visual_changed"] and not evidence["structural_changed"] and not evidence["content_changed"])
         self._heartbeat("storage_record")
         self.last_episode = self.memory.record(goal, observation, action, result, after, reward, action_id=intent["action_id"])
         self.memory.set("inflight_action", None)
@@ -3826,7 +4488,7 @@ class Controller:
         if vision:
             self.memory.remember("离线视觉观察（未经界面树核实） " + learning_state(observation), vision, category="visual_inference", verified=False, context=learning_state(observation))
         self.log("action_observed", episode=self.last_episode, action=self.memory.safe_action(action), note="正在输入文字" if action["kind"] == "type" else plan.get("note", ""), changed=changed, new_state=evidence["new_state"], progress=evidence["goal_progress_observed"], success=evidence["task_success_verified"], reward=reward)
-        if self.steps_since_reflection >= 12:
+        if self.steps_since_reflection >= 12 and self._component_available("ai"):
             self.steps_since_reflection = 0
             try:
                 self._heartbeat("reflect_ai")
@@ -3837,6 +4499,7 @@ class Controller:
             except Cancelled:
                 raise
             except Exception as exc:
+                self._component_failed("ai", exc)
                 self.log("reflection_error", error=str(exc))
         self.events.put(("stats", self.memory.stats()))
         if cancel.wait(0.2):
@@ -3846,7 +4509,14 @@ class Controller:
         last_error = 0.0
         unchanged = 0
         while not self.shutdown.is_set():
-            interval = min(4.0, 1.0 + unchanged * 0.2) if self.desired_running else min(3.0, 1.0 + unchanged * 0.12)
+            if self.desired_running and realtime_goal(self.goal):
+                interval = min(0.9, 0.22 + unchanged * 0.06)
+            elif self.desired_running:
+                interval = min(2.4, 0.55 + unchanged * 0.12)
+            else:
+                interval = min(2.5, 0.65 + unchanged * 0.14)
+            if self.frame_timings:
+                interval = max(interval, min(2.5, 2.0 * sum(self.frame_timings) / len(self.frame_timings)))
             if self.shutdown.wait(interval):
                 return
             if not self.android_ready:
@@ -3893,61 +4563,120 @@ class Controller:
         job.start()
         return job
 
-    def manual(self, action):
+    def manual(self, action, request_id=None):
         with self.lifecycle:
+            if not self.manual_authorized():
+                self.status("AI 正在运行或停止中；点击红色按钮并等待停止完成后可手动操作")
+                return False
             self.ui_epoch += 1
+            self.manual_pending += 1
             goal = self.goal
         def work():
-            if not self.android_ready:
-                self.status("安卓仍在准备，请等待启动完成")
-                return
-            before = None
-            after = None
-            with acquired(self.action_lock, self.shutdown):
-                try:
-                    before = parse_observation(self.android.hierarchy(self.shutdown), self.android.screen_size())
-                except Exception as exc:
-                    self.log("manual_observation_unavailable", error=str(exc))
-                result = self.android.act(action, self.shutdown)
-                if before is not None and not self.shutdown.wait(0.4):
+            submitted = False
+            command_submitted = False
+            try:
+                if not self.android_ready:
+                    self.status("安卓仍在准备，请等待启动完成")
+                    return
+                before = None
+                after = None
+                with acquired(self.action_lock, self.shutdown):
+                    if not self.manual_authorized():
+                        self.log("manual_cancelled", reason="AI 已接管安卓控制权")
+                        return
+                    input_text = action.get("text") if action.get("kind") == "type" else None
                     try:
-                        after = parse_observation(self.android.hierarchy(self.shutdown), self.android.screen_size())
-                        with self.frame_lock:
-                            self.last_observation = after
+                        before = parse_observation(self.android.hierarchy(self.shutdown), self.android.screen_size(), expected_input=input_text)
+                        stamp_screenshot(before, self.android.screenshot(self.shutdown))
                     except Exception as exc:
                         self.log("manual_observation_unavailable", error=str(exc))
-            if before is not None and after is not None:
-                try:
-                    visits = self.memory.seen(learning_state(after))
-                    reward, evidence = action_outcome(goal, before, action, after, visits, identity_key=self.memory.action_secret, submitted=result.get("submitted"))
-                    result.update(evidence)
-                    result["demonstrated_by_user"] = True
-                    self.last_episode = self.memory.record(goal, before, action, result, after, reward + 0.15)
-                    self.events.put(("stats", self.memory.stats()))
-                except Exception as exc:
-                    self.log("manual_learning_error", error=str(exc))
-            self.log("manual_action", action=self.memory.safe_action(action), result=result)
+                    if input_text is not None:
+                        editable = [node for node in before["nodes"] if node.get("editable") and node.get("enabled")] if before is not None else []
+                        focused = [node for node in editable if node.get("focused")]
+                        target = focused[0] if len(focused) == 1 else editable[0] if len(editable) == 1 else None
+                        if target is not None:
+                            x1, y1, x2, y2 = target["bounds"]
+                            action["x"] = (x1 + x2) // 2
+                            action["y"] = (y1 + y2) // 2
+                        else:
+                            self.status("未检测到明确的输入控件，将尝试向当前焦点输入并验证结果")
+                    result = self.android.act(action, self.shutdown)
+                    command_submitted = result.get("submitted") is True
+                    submitted = command_submitted
+                    if before is not None:
+                        attempts = 3 if input_text is not None else 1
+                        for attempt in range(attempts):
+                            if self.shutdown.wait(0.4 if attempt == 0 else 0.25):
+                                break
+                            try:
+                                after = parse_observation(self.android.hierarchy(self.shutdown), self.android.screen_size(), expected_input=input_text)
+                                png = self.android.screenshot(self.shutdown)
+                                stamp_screenshot(after, png)
+                                self._publish_capture(after, png)
+                                if input_text is None or action_effect(before, action, after) == (True, "input_text_visible"):
+                                    break
+                            except Exception as exc:
+                                self.log("manual_observation_unavailable", error=str(exc))
+                    if input_text is not None:
+                        verified = bool(command_submitted and before is not None and after is not None and action_effect(before, action, after) == (True, "input_text_visible"))
+                        result["input_verified"] = verified
+                        submitted = verified
+                        if not verified:
+                            self.status("输入指令可能已发送，但界面未能确认文字已进入目标输入框；已保留原输入，避免误报成功")
+                if before is not None and after is not None:
+                    try:
+                        visits = self.memory.seen(learning_state(after))
+                        reward, evidence = action_outcome(goal, before, action, after, visits, identity_key=self.memory.action_secret, submitted=result.get("submitted"))
+                        result.update(evidence)
+                        result["demonstrated_by_user"] = True
+                        self.last_episode = self.memory.record(goal, before, action, result, after, reward + 0.15)
+                        self.events.put(("stats", self.memory.stats()))
+                    except Exception as exc:
+                        self.log("manual_learning_error", error=str(exc))
+                self.log("manual_action", action=self.memory.safe_action(action), result=result)
+            finally:
+                if request_id is not None:
+                    self.events.put(("manual_text_result", {"request_id": request_id, "submitted": submitted, "command_sent": command_submitted}))
+                with self.lifecycle:
+                    self.manual_pending -= 1
         self._job(work, "ManualAndroid")
+        return True
 
     def install(self, source):
+        with self.lifecycle:
+            if not self.manual_authorized():
+                self.status("AI 正在运行或停止中；点击红色按钮并等待停止完成后可安装 APK")
+                return False
+            self.ui_epoch += 1
+            self.manual_pending += 1
         def work():
-            if not self.android_ready:
-                raise RuntimeError("安卓尚未准备完成")
-            folder = self.root / "apps"
-            folder.mkdir(parents=True, exist_ok=True)
-            source_path = pathlib.Path(source)
-            target = folder / source_path.name
-            if source_path.resolve() != target.resolve():
-                if target.exists():
-                    target = folder / (source_path.stem + "_" + uuid.uuid4().hex[:8] + ".apk")
-                shutil.copy2(source_path, target)
-            self.status("正在安装 " + source_path.name)
-            with acquired(self.action_lock, self.shutdown):
-                self.ui_epoch += 1
-                result = self.android.install_apk(target, self.shutdown)
-            self.status("已安装 " + source_path.name)
-            self.log("user_apk_install", file=target.name, result=result)
+            try:
+                if not self.android_ready:
+                    raise RuntimeError("安卓尚未准备完成")
+                if not self.manual_authorized():
+                    self.log("install_cancelled", reason="AI 已接管安卓控制权")
+                    return
+                folder = self.root / "apps"
+                folder.mkdir(parents=True, exist_ok=True)
+                source_path = pathlib.Path(source)
+                target = folder / source_path.name
+                if source_path.resolve() != target.resolve():
+                    if target.exists():
+                        target = folder / (source_path.stem + "_" + uuid.uuid4().hex[:8] + ".apk")
+                    shutil.copy2(source_path, target)
+                self.status("正在安装 " + source_path.name)
+                with acquired(self.action_lock, self.shutdown):
+                    if not self.manual_authorized():
+                        self.log("install_cancelled", reason="安装前 AI 已接管安卓控制权")
+                        return
+                    result = self.android.install_apk(target, self.shutdown)
+                self.status("已安装 " + source_path.name)
+                self.log("user_apk_install", file=target.name, result=result)
+            finally:
+                with self.lifecycle:
+                    self.manual_pending -= 1
         self._job(work, "InstallAPK")
+        return True
 
     def import_knowledge(self, paths):
         def work():
@@ -4007,15 +4736,18 @@ class Controller:
         self._job(work, "ImportKnowledge")
 
     def chat(self, text):
-        if self.chat_busy:
-            self.status("上一条本地问答仍在生成")
-            return
-        if not self.operational_ready:
-            self.events.put(("notice", ("本地 AI 尚未就绪", "点击绿色按钮完成首次准备后即可使用离线问答。")))
-            return
-        self.chat_busy = True
-        cancel = threading.Event()
-        self.chat_cancel = cancel
+        with self.lifecycle:
+            if self.shutdown.is_set():
+                return False
+            if self.chat_busy:
+                self.status("上一条本地问答仍在生成")
+                return False
+            if not self.operational_ready:
+                self.events.put(("notice", ("本地 AI 尚未就绪", "点击绿色按钮完成首次准备后即可使用离线问答。")))
+                return False
+            self.chat_busy = True
+            cancel = threading.Event()
+            self.chat_cancel = cancel
         self.events.put(("chat_user", text))
         def work():
             try:
@@ -4026,13 +4758,20 @@ class Controller:
                 self.status("本地 AI 正在回答")
                 with acquired(self.model_lock, cancel):
                     answer = self.ai.chat(text, memory=memory, cancel=cancel)
-                self.log("chat_completed", question=text, answer=answer)
+                self.log("chat_completed", question_length=len(text), answer_length=len(answer))
                 self.events.put(("chat_answer", answer))
             except Cancelled:
                 self.events.put(("chat_answer", "已停止本次回答。"))
+            except Exception as exc:
+                self._component_failed("ai", exc)
+                self.events.put(("chat_answer", "本地推理暂时不可用，正在自动尝试恢复：" + str(exc)[:180]))
             finally:
-                self.chat_busy = False
+                with self.lifecycle:
+                    self.chat_busy = False
+                    if self.chat_cancel is cancel:
+                        self.chat_cancel = None
         self._job(work, "LocalChat")
+        return True
 
     def give_feedback(self, value):
         episode = self.last_episode
@@ -4068,29 +4807,36 @@ class Controller:
                 staging = pathlib.Path(tempfile.mkdtemp(prefix="blackbox_", dir=base))
                 payload = staging / "payload"
                 payload.mkdir()
-                with self.memory.lock:
-                    self.memory.backup(payload / "memory.sqlite3")
-                    archive_root = self.memory.root / "archives"
-                    if archive_root.is_dir():
-                        for archived in sorted(archive_root.glob("episodes-*.jsonl.gz")):
-                            if archived.is_file():
-                                shutil.copy2(archived, payload / ("archive_" + archived.name))
+                self.memory.backup(payload / "memory.sqlite3")
+                archive_root = self.memory.root / "archives"
+                if archive_root.is_dir():
+                    for archived in sorted(archive_root.glob("episodes-*.jsonl.gz")):
+                        if archived.is_file():
+                            shutil.copy2(archived, payload / ("archive_" + archived.name))
                 atomic_json(payload / "android_diagnostics.json", self.android.diagnostics(self.shutdown))
                 with self.frame_lock:
-                    frame = self.frame
-                    observation = self.last_observation
-                if frame:
-                    (payload / "android_screen.png").write_bytes(frame)
+                    capture = self.capture_record
+                    latest_frame = self.frame
+                    latest_number = self.frame_number
+                    observation = capture["observation"] if capture else self.last_observation
+                    paired_frame = capture["png"] if capture else None
+                    captured_at = capture["captured_at"] if capture else None
+                    capture_number = capture["number"] if capture else None
+                if latest_frame:
+                    (payload / "android_screen.png").write_bytes(latest_frame)
+                if paired_frame:
+                    (payload / "android_screen_paired.png").write_bytes(paired_frame)
                 if observation:
                     atomic_json(payload / "observation.json", persistent_observation(observation))
+                atomic_json(payload / "capture_metadata.json", {"paired_capture": capture is not None, "paired_captured_at": captured_at, "paired_frame_number": capture_number, "latest_frame_number": latest_number, "structural_state": observation.get("state", "") if observation else "", "content_state": observation.get("content_state", "") if observation else "", "image_signature": observation.get("image_signature", "") if observation else "", "image_exact_signature": observation.get("image_exact_signature", "") if observation else "", "latest_screen_bytes": len(latest_frame) if latest_frame else 0, "paired_screen_bytes": len(paired_frame) if paired_frame else 0})
                 event_report = self.memory.event_digest(recent_limit=6000, critical_limit=2000)
                 for filename, events in (("events.jsonl", event_report["recent"]), ("critical_events.jsonl", event_report["critical"])):
                     with (payload / filename).open("w", encoding="utf-8") as handle:
                         for event in events:
                             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-                atomic_json(payload / "event_summary.json", {"totals": event_report["totals"], "retention": event_report["retention"], "learning_quality": self.memory.experience_quality(), "ui_events_dropped": getattr(self.events, "dropped", 0), "runtime_performance_seconds": {"planning_avg": round(sum(self.planning_timings) / len(self.planning_timings), 3) if self.planning_timings else None, "vision_avg": round(sum(self.visual_timings) / len(self.visual_timings), 3) if self.visual_timings else None, "frame_avg": round(sum(self.frame_timings) / len(self.frame_timings), 3) if self.frame_timings else None}})
+                atomic_json(payload / "event_summary.json", {"totals": event_report["totals"], "retention": event_report["retention"], "learning_quality": self.memory.experience_quality(), "goal_learning_quality": self.memory.goal_quality(self.goal), "ui_events_dropped": getattr(self.events, "dropped", 0), "runtime_performance_seconds": {"planning_avg": round(sum(self.planning_timings) / len(self.planning_timings), 3) if self.planning_timings else None, "vision_avg": round(sum(self.visual_timings) / len(self.visual_timings), 3) if self.visual_timings else None, "frame_avg": round(sum(self.frame_timings) / len(self.frame_timings), 3) if self.frame_timings else None}})
                 atomic_json(payload / "privacy.json", {"contains_private_data": True, "data_types": ["安卓截图和应用界面", "聊天内容与任务目标", "运行事件与操作记录", "SQLite 长期经验与输入动作的脱敏标识", "可能包含应用和设备诊断信息"], "sharing_guidance": "分享前检查并移除不希望披露的私人信息；动作输入文本按设计在存储时脱敏，但其他日志和截图可能包含敏感内容。"})
-                diagnostics = {"application": APP_NAME, "version": APP_VERSION, "captured_at": utc_now(), "python": platform.python_version(), "system": platform.platform(), "cpu_count": os.cpu_count(), "memory_mb": physical_memory_mb(), "memory_available_mb": available_memory_mb(), "disk_free_mb": shutil.disk_usage(self.root).free // 1048576, "running": self.desired_running, "generation": self.generation, "goal": self.goal, "assets_ready": self.assets_ready, "recovery_count": self.android._failures, "inflight_action": self.memory.get("inflight_action"), "android": {"ready": self.android.ready(), "booted": self.android.booted, "serial": self.android.serial, "acceleration": self.android.acceleration, "gpu": self.android.gpu_mode, "ram_mb": self.android.memory_mb, "cores": self.android.cores, "screen": self.android.screen_size()}, "ai": {"engine": self.ai.ENGINE_TAG, "model": self.ai.MODEL_FILE, "model_sha256": self.ai.MODEL_SHA256, "threads": self.ai.threads, "alive": self.ai.alive()}, "vision": {"model": self.vision.MODEL_FILE, "model_sha256": self.vision.MODEL_SHA256, "projector": self.vision.MMPROJ_FILE, "projector_sha256": self.vision.MMPROJ_SHA256, "alive": self.vision.alive()}, "counts": self.memory.stats(), "learning_quality": self.memory.experience_quality(), "supervisor": read_json(self.supervisor_state_path, {}), "ui_events_dropped": getattr(self.events, "dropped", 0)}
+                diagnostics = {"application": APP_NAME, "version": APP_VERSION, "captured_at": utc_now(), "python": platform.python_version(), "system": platform.platform(), "cpu_count": os.cpu_count(), "memory_mb": physical_memory_mb(), "memory_available_mb": available_memory_mb(), "disk_free_mb": shutil.disk_usage(self.root).free // 1048576, "running": self.desired_running, "generation": self.generation, "goal": self.goal, "assets_ready": self.assets_ready, "recovery_count": self.android._failures, "inflight_action": self.memory.get("inflight_action"), "android": {"ready": self.android.ready(), "booted": self.android.booted, "serial": self.android.serial, "acceleration": self.android.acceleration, "gpu": self.android.gpu_mode, "ram_mb": self.android.memory_mb, "cores": self.android.cores, "screen": self.android.screen_size()}, "ai": {"engine": self.ai.ENGINE_TAG, "model": self.ai.MODEL_FILE, "model_sha256": self.ai.MODEL_SHA256, "threads": self.ai.threads, "alive": self.ai.alive()}, "vision": {"model": self.vision.MODEL_FILE, "model_sha256": self.vision.MODEL_SHA256, "projector": self.vision.MMPROJ_FILE, "projector_sha256": self.vision.MMPROJ_SHA256, "alive": self.vision.alive()}, "counts": self.memory.stats(), "learning_quality": self.memory.experience_quality(), "goal_learning_quality": self.memory.goal_quality(self.goal), "supervisor": read_json(self.supervisor_state_path, {}), "ui_events_dropped": getattr(self.events, "dropped", 0)}
                 atomic_json(payload / "diagnostics.json", diagnostics)
                 support_paths = self.android.state_paths() + [self.supervisor_state_path, self.run_intent_path, self.root / "logs" / "supervisor-restarts.jsonl", self.root / "logs" / "supervisor-output.log"]
                 for index, path in enumerate(support_paths):
@@ -4120,6 +4866,8 @@ class Controller:
                         raise OSError("黑匣子压缩包校验失败：" + damaged)
                 desktop = desktop_directory()
                 desktop.mkdir(parents=True, exist_ok=True)
+                if shutil.disk_usage(desktop).free < archive_path.stat().st_size + 67108864:
+                    raise OSError("桌面所在磁盘剩余空间不足，无法可靠导出黑匣子")
                 name = "AndroidAI_BlackBox_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".zip"
                 destination = desktop / name
                 desktop_partial = desktop / ("." + name + ".part")
@@ -4199,6 +4947,8 @@ class Application:
         self.offset = (0, 0)
         self.press = None
         self.closing = False
+        self._last_manual_enabled = None
+        self.manual_text_request = None
         self.window.title(APP_NAME)
         available_width = self.window.winfo_screenwidth()
         available_height = self.window.winfo_screenheight()
@@ -4241,6 +4991,8 @@ class Application:
         self.green = self._button(toolbar, "启动 AI" if consent else "同意 SDK 条款并启动 AI", self.start, "#17834b")
         self.green.pack(side="left", padx=(0, 10))
         self._button(toolbar, "停止 AI", self.stop, "#c83e49").pack(side="left", padx=(0, 10))
+        self.operation_state_var = tk.StringVar(value="已停止")
+        tk.Label(toolbar, textvariable=self.operation_state_var, fg="#a8cafa", bg="#101827", font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 10))
         self._button(toolbar, "导出桌面黑匣子", self.controller.export, "#246dc9").pack(side="left", padx=(0, 10))
         self._button(toolbar, "工作文件夹", self.open_folder).pack(side="right")
         self.terms = tk.Label(self.window, text="首次启动会联网下载安卓组件和模型；点击绿色按钮即同意 Android SDK 条款。查看条款", fg="#a8cafa", bg="#101827", font=("Microsoft YaHei UI", 9), cursor="hand2", anchor="w")
@@ -4260,14 +5012,18 @@ class Application:
         self.canvas.bind("<Configure>", lambda event: setattr(self, "last_frame_number", -1))
         controls = tk.Frame(left, bg="#101827")
         controls.pack(fill="x", pady=8)
+        self.manual_buttons = []
         for label, action in (("返回", "back"), ("主页", "home"), ("最近应用", "recents"), ("安装 APK", "apk")):
             command = self.install_apk if action == "apk" else lambda value=action: self.controller.manual({"kind": value})
-            self._button(controls, label, command).pack(side="left", padx=(0, 5))
+            self.manual_buttons.append(self._button(controls, label, command))
+            self.manual_buttons[-1].pack(side="left", padx=(0, 5))
         text_row = tk.Frame(left, bg="#101827")
         text_row.pack(fill="x")
         self.input_var = tk.StringVar()
-        tk.Entry(text_row, textvariable=self.input_var, bg="#1a2a40", fg="#f1f5fa", insertbackground="white", relief="flat", font=("Microsoft YaHei UI", 10)).pack(side="left", fill="x", expand=True, ipady=9)
-        self._button(text_row, "输入", self.type_text).pack(side="right", padx=(6, 0))
+        self.manual_text_entry = tk.Entry(text_row, textvariable=self.input_var, bg="#1a2a40", fg="#f1f5fa", insertbackground="white", relief="flat", font=("Microsoft YaHei UI", 10))
+        self.manual_text_entry.pack(side="left", fill="x", expand=True, ipady=9)
+        self.manual_text_button = self._button(text_row, "输入", self.type_text)
+        self.manual_text_button.pack(side="right", padx=(6, 0))
         right = tk.Frame(body, bg="#101827")
         right.pack(side="left", fill="both", expand=True)
         tk.Label(right, text="当前目标", bg="#101827", fg="#f1f5fa", font=("Microsoft YaHei UI", 11, "bold"), anchor="w").pack(fill="x")
@@ -4303,7 +5059,7 @@ class Application:
 
     @staticmethod
     def _stats_text(stats):
-        return f"已记录 {stats.get('episodes', 0)} 次操作 · {stats.get('states', 0)} 个界面 · {stats.get('knowledge', 0)} 条记忆"
+        return f"已记录 {stats.get('episodes', 0)} 次操作 · {stats.get('states', 0)} 个界面 · {stats.get('knowledge', 0)} 条记忆 · {stats.get('successful_routes', 0)} 条成功路径"
 
     def start(self):
         self.controller.accept_terms()
@@ -4330,6 +5086,8 @@ class Application:
             webbrowser.open(SDK_TERMS_URL)
 
     def install_apk(self):
+        if not self.controller.manual_authorized():
+            return
         path = filedialog.askopenfilename(parent=self.window, title="选择本地 APK", filetypes=[("Android 应用", "*.apk")])
         if path:
             self.controller.install(path)
@@ -4341,14 +5099,16 @@ class Application:
 
     def type_text(self):
         text = self.input_var.get()
-        if text:
-            self.controller.manual({"kind": "type", "text": text})
-            self.input_var.set("")
+        if not text or self.manual_text_request is not None:
+            return
+        request_id = uuid.uuid4().hex
+        if self.controller.manual({"kind": "type", "text": text}, request_id=request_id):
+            self.manual_text_request = (request_id, text)
+            self.manual_text_button.configure(state="disabled")
 
     def send_chat(self):
         text = self.chat_var.get().strip()
-        if text:
-            self.controller.chat(text)
+        if text and self.controller.chat(text):
             self.chat_var.set("")
 
     def _screen_point(self, x, y):
@@ -4360,10 +5120,16 @@ class Application:
         return None
 
     def screen_down(self, event):
+        if not self.controller.manual_authorized() or not self.controller.android_ready:
+            self.press = None
+            return
         point = self._screen_point(event.x, event.y)
         self.press = (point, time.monotonic()) if point else None
 
     def screen_up(self, event):
+        if not self.controller.manual_authorized() or not self.controller.android_ready:
+            self.press = None
+            return
         point = self._screen_point(event.x, event.y)
         if self.press and point:
             origin, started = self.press
@@ -4389,6 +5155,20 @@ class Application:
     def poll(self):
         if self.closing:
             return
+        state = self.controller.operation_state()
+        if self.controller.prepared_announced:
+            self.terms.configure(text="安卓、离线语言模型和视觉模型已通过本机验证。点击查看本地组件许可证")
+        state_labels = {"RUNNING": "AI 运行中", "RECOVERING": "AI 正在自动恢复", "STOPPING": "正在停止 AI", "STOPPED": "AI 已停止"}
+        self.operation_state_var.set(state_labels[state])
+        self.green.configure(text={"RUNNING": "运行中 · 更新目标", "RECOVERING": "恢复中 · 更新目标", "STOPPING": "正在停止 · 可重新启动", "STOPPED": "启动 / 更新目标"}[state])
+        manual_enabled = state == "STOPPED" and self.controller.android_ready
+        if self._last_manual_enabled != manual_enabled:
+            self._last_manual_enabled = manual_enabled
+            for widget in self.manual_buttons + [self.manual_text_entry, self.manual_text_button]:
+                widget.configure(state="normal" if manual_enabled else "disabled")
+            if not manual_enabled:
+                self.press = None
+        self.manual_text_button.configure(state="normal" if manual_enabled and self.manual_text_request is None else "disabled")
         for _ in range(120):
             try:
                 kind, value = self.events.get_nowait()
@@ -4399,16 +5179,24 @@ class Application:
             elif kind == "log":
                 details = json.dumps(value["fields"], ensure_ascii=False, default=str)
                 self._append(self.log_box, value["time"] + "  " + value["kind"] + "  " + details[:1000])
-            elif kind == "running":
-                self.green.configure(text="运行中 · 更新目标" if value else "启动 AI")
-            elif kind == "stopping":
-                self.green.configure(text="正在停止 · 可重新启动")
+            elif kind in {"running", "stopping"}:
+                pass
             elif kind == "stats":
                 self.stats_var.set(self._stats_text(value))
             elif kind == "prepared":
-                self.terms.configure(text="运行组件已准备；再次启动可离线使用。点击查看本地组件许可证")
+                self.terms.configure(text="安卓、离线语言模型和视觉模型已通过本机验证。点击查看本地组件许可证")
             elif kind in {"chat_user", "chat_answer"}:
                 self._append(self.chat_box, ("你：" if kind == "chat_user" else "本地 AI：") + value + "\n")
+            elif kind == "manual_text_result":
+                pending = self.manual_text_request
+                if pending is not None and pending[0] == value.get("request_id"):
+                    if value.get("submitted") and self.input_var.get() == pending[1]:
+                        self.input_var.set("")
+                    elif value.get("command_sent"):
+                        self.status_var.set("输入指令已发送，但无法验证结果；原文字已保留，请检查输入框后再决定是否重试")
+                    else:
+                        self.status_var.set("输入指令未成功发出，原文字已保留")
+                    self.manual_text_request = None
             elif kind == "exported":
                 self._append(self.log_box, "黑匣子已保存：" + value)
             elif kind == "storage_error":
