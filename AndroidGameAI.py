@@ -121,7 +121,7 @@ import statistics
 APP_NAME = "通用游戏 Agent · 自适应视觉与智能交互"
 
 
-APP_VERSION = "8.7.0-local-learning"
+APP_VERSION = "8.8.0-local-learning"
 
 
 RUNTIME_BYTES_PER_KIB = 1024
@@ -2048,7 +2048,7 @@ class AndroidRuntime:
         check_cancel(cancel)
         if self._external or not self.owned:
             return False
-        groups = tuple(frozenset(abis) for abis in package_abis.values() if abis)
+        groups = tuple(frozenset(group) for collection in package_abis.values() for group in (collection if isinstance(collection, (tuple, list)) else (collection,)) if group)
         choices = self._local_system_images(minimum_sdk=minimum_sdk, cancel=cancel)
         compatible = [choice for choice in choices if all(not group.isdisjoint(self._image_supported_abis(choice)) for group in groups)]
         if not compatible and minimum_sdk > self.device_api_level and all(not group or not group.isdisjoint({"x86", "x86_64"}) for group in groups):
@@ -2537,9 +2537,13 @@ class AndroidRuntime:
     def _restart_adb(self, cancel):
         check_cancel(cancel)
         if self._external:
-            self._disconnect_adb_streams()
+            self._discard_adb_server()
             self.booted = False
             self._prepared = False
+            self._input_verified = False
+            self._local_authorized = False
+            self.serial = None
+            self._last_health = 0.0
             self.prepare(cancel)
             return
         self._disconnect_adb_streams()
@@ -2555,6 +2559,19 @@ class AndroidRuntime:
         if self._adb_job is job:
             self._adb_job = None
         self._start_adb(cancel)
+
+    def _discard_adb_server(self):
+        self._disconnect_adb_streams()
+        process, job = self.adb_process, self._adb_job
+        if process is not None:
+            self._kill_owned(process)
+        if job is not None:
+            job.close()
+        if self.adb_process is process:
+            self.adb_process = None
+        if self._adb_job is job:
+            self._adb_job = None
+        self.adb_port = None
 
     def _adb_launch_log(self, offset):
         try:
@@ -3758,9 +3775,11 @@ class AndroidRuntime:
         if self._external:
             with contextlib.suppress(Exception):
                 self.release_touches()
-            self._disconnect_adb_streams()
+            self._discard_adb_server()
             self.booted = False
             self._prepared = False
+            self._local_authorized = False
+            self.serial = None
             self._touches.clear()
             self._input_layout = None
             self._last_context = {}
@@ -4491,6 +4510,15 @@ AI_MEMORY_ARCHIVE_MAX_BYTES = 1073741824
 AI_ACTION_KINDS = ("tap", "long_press", "swipe", "touch", "touch_begin", "touch_update", "touch_end", "touch_release_all", "back", "home", "recents", "enter", "keyevent", "type", "wait")
 
 
+AI_OBSERVATION_ONLY_ACTIONS = frozenset(("wait", "touch_release_all"))
+
+
+AI_TERMINAL_CREDIT_ACTIONS = frozenset(("tap", "long_press", "swipe", "touch", "touch_begin", "touch_update", "touch_end", "enter", "keyevent"))
+
+
+AI_TEMPORAL_CONTROL_ACTIONS = frozenset(("swipe", "long_press", "touch", "touch_begin", "touch_update"))
+
+
 AI_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -4651,12 +4679,16 @@ import heapq
 
 
 LOCAL_AGENT_SCHEMA_VERSION = 1
+LOCAL_AGENT_ATTRIBUTION_SCHEMA_VERSION = 2
 LOCAL_AGENT_HOEFFDING_FACTOR = 2
 LOCAL_AGENT_COLOR_LEVELS = math.isqrt(AI_BYTE_MAX + 1)
 LOCAL_AGENT_HALTON_BASES = (2, 3)
 LOCAL_AGENT_DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 LOCAL_AGENT_WIN_LABELS = frozenset(("victory", "you win", "you won", "winner", "victory royale", "战斗胜利", "对局胜利", "游戏胜利", "胜利", "获胜", "挑战成功"))
 LOCAL_AGENT_LOSS_LABELS = frozenset(("defeat", "you lose", "you lost", "defeated", "战斗失败", "对局失败", "游戏失败", "失败", "挑战失败"))
+
+
+LOCAL_AGENT_RESULT_ACTION_LABELS = frozenset(("play again", "try again", "retry", "restart", "next match", "再来一局", "再来一次", "重新开始", "再次挑战", "返回大厅", "返回主页", "继续挑战"))
 LOCAL_AGENT_LOADING_LABELS = frozenset(("loading", "please wait", "正在加载", "加载中", "请稍候", "正在连接"))
 LOCAL_AGENT_SELF_TURN_LABELS = frozenset(("your turn", "your move", "your round", "你的回合", "轮到你了", "请出牌", "轮到我方", "该你出牌", "你来行动"))
 LOCAL_AGENT_OTHER_TURN_LABELS = frozenset(("opponent's turn", "enemy turn", "waiting for opponent", "对方回合", "等待对手", "对手出牌中", "等待其他玩家", "等待对方出牌", "敌方回合"))
@@ -4712,6 +4744,21 @@ LOCAL_AGENT_GAME_OBJECTIVES = {
     "happy_poker": "优先识别手牌、出牌控件、回合与对局结果",
     "art_of_war_3": "区分单位选择、移动和战场目标",
 }
+
+
+LOCAL_AGENT_GAME_OBSERVABLES = {
+    "honor_of_kings": {"combat": ("攻击", "attack", "技能", "skill"), "progress": ("击杀数", "我方推塔", "towers_destroyed")},
+    "clash_of_clans": {"deployment": ("部署", "deploy", "兵种", "troops"), "progress": ("星数", "earned_stars")},
+    "clash_royale": {"deployment": ("部署", "deploy", "卡牌", "card"), "progress": ("剩余敌方防御塔", "enemy_towers_remaining")},
+    "boom_beach": {"deployment": ("部队", "troops", "部署", "deploy"), "progress": ("已摧毁防御塔", "towers_destroyed")},
+    "minecraft": {"interaction": ("背包", "inventory", "合成", "craft"), "progress": ("生命值", "health")},
+    "million_lords": {"strategy": ("领地", "territory", "集结", "rally"), "progress": ("已占领据点", "captured_outposts")},
+    "happy_poker": {"cards": ("出牌", "play cards", "提示", "hint"), "turn": ("你的回合", "your turn")},
+    "art_of_war_3": {"strategy": ("攻击", "attack", "采集", "collect"), "progress": ("剩余敌方防御塔", "enemy_towers_remaining")},
+}
+
+
+LOCAL_AGENT_OBSERVED_GAME_CONTROL_PRIOR = AI_VISUAL_CONTROL_PRIOR / AI_SPATIAL_DIMENSIONS
 
 
 def local_agent_number(value, default=0.0):
@@ -4865,16 +4912,21 @@ LOCAL_AGENT_GENRE_LABELS = {
     "moba": "实时竞技与虚拟摇杆", "realtime": "实时双区触控", "card_battle": "卡牌拖放竞技",
     "sandbox": "沙盒与视角控制", "cards": "回合式卡牌", "strategy": "策略与单位部署", "generic": "通用未知玩法",
 }
+LOCAL_AGENT_LAYOUT_CENTER = AI_COORDINATE_SCALE // AI_SPATIAL_DIMENSIONS
+LOCAL_AGENT_LAYOUT_SIDE = AI_COORDINATE_SCALE // (AI_RGB_CHANNELS + AI_SPATIAL_DIMENSIONS)
+LOCAL_AGENT_LAYOUT_FAR_SIDE = AI_COORDINATE_SCALE - LOCAL_AGENT_LAYOUT_SIDE
+LOCAL_AGENT_LAYOUT_TOP = AI_COORDINATE_SCALE // AI_RGBA_CHANNELS
+LOCAL_AGENT_LAYOUT_BOTTOM = AI_COORDINATE_SCALE - LOCAL_AGENT_LAYOUT_TOP
 LOCAL_AGENT_GENRE_ANCHORS = {
-    "moba": {"move": (180, 790), "action": (850, 800), "center": (500, 480)},
-    "realtime": {"move": (180, 790), "action": (850, 800), "center": (500, 480)},
-    "sandbox": {"move": (190, 780), "action": (870, 760), "center": (520, 440)},
-    "card_battle": {"hand": (460, 875), "arena": (490, 420), "action": (810, 865)},
-    "cards": {"hand": (490, 855), "action": (840, 765), "center": (480, 540)},
-    "strategy": {"unit": (380, 635), "target": (630, 405), "center": (500, 500)},
+    "moba": {"move": (LOCAL_AGENT_LAYOUT_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "action": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "center": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_CENTER)},
+    "realtime": {"move": (LOCAL_AGENT_LAYOUT_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "action": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "center": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_CENTER)},
+    "sandbox": {"move": (LOCAL_AGENT_LAYOUT_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "action": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "center": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_CENTER)},
+    "card_battle": {"hand": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_BOTTOM), "arena": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_TOP), "action": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM)},
+    "cards": {"hand": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_BOTTOM), "action": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "center": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_CENTER)},
+    "strategy": {"unit": (LOCAL_AGENT_LAYOUT_SIDE, LOCAL_AGENT_LAYOUT_BOTTOM), "target": (LOCAL_AGENT_LAYOUT_FAR_SIDE, LOCAL_AGENT_LAYOUT_TOP), "center": (LOCAL_AGENT_LAYOUT_CENTER, LOCAL_AGENT_LAYOUT_CENTER)},
 }
 LOCAL_AGENT_GENRE_MOTION_DIRECTIONS = LOCAL_AGENT_DIRECTIONS
-LOCAL_AGENT_UI_HYPOTHESIS_SPAN = 90
+LOCAL_AGENT_UI_HYPOTHESIS_SPAN = AI_COORDINATE_SCALE // (AI_RGB_CHANNELS * AI_RGBA_CHANNELS)
 LOCAL_AGENT_GAME_INTENTS = {
     "cards": (("出牌", "play cards", "submit cards", "确认出牌"), ("提示", "hint", "选择", "select")),
     "card_battle": (("部署", "deploy", "使用卡牌", "play card"), ("下一步", "next")),
@@ -4925,6 +4977,20 @@ def local_agent_game_profile(descriptor):
             radius_y = max(1, height * LOCAL_AGENT_UI_HYPOTHESIS_SPAN // LOCAL_AGENT_PROFILE_TOUCH_FRACTION)
             annotations.append({"source": "layout_hypothesis", "kind": "control_hypothesis", "bounds": [max(0, x - radius_x), max(0, y - radius_y), min(width, x + radius_x), min(height, y + radius_y)], "x": x, "y": y, "label": names.get(role, "操作区域候选"), "role": role})
     return {"genre": genre, "game_id": game_id, "objective": LOCAL_AGENT_GAME_OBJECTIVES.get(game_id, "从可验证画面反馈中学习操作效果"), "label": LOCAL_AGENT_GENRE_LABELS[genre], "evidence": identified_by, "anchors": anchors, "annotations": annotations, "rule_understood": False}
+
+
+def local_agent_game_observed_state(descriptor):
+    game_id = descriptor.get("profile", {}).get("game_id", "unclassified")
+    vocabulary = LOCAL_AGENT_GAME_OBSERVABLES.get(game_id, {})
+    labels = {local_agent_label(node.get("text") or node.get("content_desc") or node.get("description")) for node in descriptor.get("nodes", ()) if isinstance(node, dict)}
+    observed = {}
+    for category, terms in vocabulary.items():
+        matched = sorted(label for label in labels if label and any(local_agent_label(term) in label for term in terms))
+        if matched:
+            observed[category] = matched[:AI_MEMORY_DEFAULT_RECALL]
+    scores = descriptor.get("scores", {})
+    verified_scores = [str(item.get("label", ""))[:AI_LABEL_FIELD_LIMIT] for item in scores.values() if isinstance(item, dict)]
+    return {"game": game_id, "observed_ui": observed, "visible_scores": verified_scores[:AI_MEMORY_DEFAULT_RECALL], "turn": descriptor.get("turn", "unknown"), "rule_understood": False}
 
 
 def local_agent_semantic_actions(descriptor):
@@ -5273,6 +5339,36 @@ class GameAI:
                 connection.execute("CREATE TABLE IF NOT EXISTS agent_terminal_templates(package TEXT NOT NULL,outcome TEXT NOT NULL,screen TEXT NOT NULL,features TEXT NOT NULL,confirmations INTEGER NOT NULL,last_seen TEXT NOT NULL,PRIMARY KEY(package,outcome,screen,features))")
                 connection.execute("CREATE INDEX IF NOT EXISTS agent_terminal_lookup ON agent_terminal_templates(package,screen,confirmations DESC)")
                 connection.execute("INSERT OR IGNORE INTO agent_meta(key,value) VALUES('schema',?)", (json.dumps(LOCAL_AGENT_SCHEMA_VERSION),))
+                attribution = connection.execute("SELECT value FROM agent_meta WHERE key='learning_attribution_version'").fetchone()
+                try:
+                    attribution_version = int(json.loads(attribution["value"])) if attribution is not None else 0
+                except (TypeError, ValueError, OverflowError):
+                    attribution_version = 0
+                if attribution_version < LOCAL_AGENT_ATTRIBUTION_SCHEMA_VERSION:
+                    cursor = 0
+                    affected = set()
+                    while True:
+                        batch = connection.execute("SELECT rowid,package,state_key,action_key,action FROM agent_actions WHERE rowid>? ORDER BY rowid LIMIT ?", (cursor, AI_MEMORY_ARCHIVE_BATCH)).fetchall()
+                        if not batch:
+                            break
+                        cursor = batch[-1]["rowid"]
+                        for entry in batch:
+                            try:
+                                kind = json.loads(entry["action"]).get("kind")
+                            except (TypeError, ValueError, AttributeError):
+                                continue
+                            if kind not in AI_OBSERVATION_ONLY_ACTIONS:
+                                continue
+                            identity = (entry["package"], entry["state_key"], entry["action_key"])
+                            connection.execute("DELETE FROM agent_transitions WHERE package=? AND state_key=? AND action_key=?", identity)
+                            connection.execute("DELETE FROM agent_actions WHERE package=? AND state_key=? AND action_key=?", identity)
+                            affected.add((entry["package"], entry["state_key"]))
+                    for package, state in affected:
+                        row = connection.execute("SELECT COALESCE(MAX(q),0) AS value,COALESCE(MAX(iq),0) AS intrinsic FROM agent_actions WHERE package=? AND state_key=?", (package, state)).fetchone()
+                        connection.execute("UPDATE agent_states SET value=?,intrinsic_value=? WHERE package=? AND state_key=?", (row["value"], row["intrinsic"], package, state))
+                    connection.execute("INSERT INTO agent_meta(key,value) VALUES('learning_attribution_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(LOCAL_AGENT_ATTRIBUTION_SCHEMA_VERSION),))
+                    if affected:
+                        self.log("legacy_observation_rewards_invalidated", affected_states=len(affected), reason="observation_actions_not_causal_gameplay")
                 row = connection.execute("SELECT value FROM agent_meta WHERE key='statistics'").fetchone()
                 if row is not None:
                     saved = json.loads(row["value"])
@@ -5619,18 +5715,14 @@ class GameAI:
         cells = [[0.0] * (AI_RGB_CHANNELS + 1) for _ in range(coarse_columns * coarse_rows)]
         contrast = []
         mean = tuple(sum(pixel[channel] for pixel in samples) / len(samples) for channel in range(AI_RGB_CHANNELS))
+        edges = vision_edge_strengths(samples, (width, height))
         for index, pixel in enumerate(samples):
             row, column = divmod(index, columns)
             cell = cells[min(coarse_rows - 1, row * coarse_rows // rows) * coarse_columns + min(coarse_columns - 1, column * coarse_columns // columns)]
             for channel in range(AI_RGB_CHANNELS):
                 cell[channel] += pixel[channel]
             cell[-1] += 1
-            adjacent = []
-            for dx, dy in LOCAL_AGENT_DIRECTIONS:
-                nx, ny = column + dx, row + dy
-                if 0 <= nx < columns and 0 <= ny < rows:
-                    adjacent.append(samples[ny * columns + nx])
-            edge = sum(sum(abs(a - b) for a, b in zip(pixel, neighbor)) for neighbor in adjacent) / max(1, len(adjacent) * AI_RGB_CHANNELS * AI_BYTE_MAX)
+            edge = edges[index]
             color = sum(abs(a - b) for a, b in zip(pixel, mean)) / (AI_RGB_CHANNELS * AI_BYTE_MAX)
             contrast.append((edge + color, column, row))
         quantized = tuple(round(cell[channel] / max(1, cell[-1]) * (AI_VISION_STATE_LEVELS - 1) / AI_BYTE_MAX) for cell in cells for channel in range(AI_RGB_CHANNELS))
@@ -5757,8 +5849,9 @@ class GameAI:
                 clickable.append(node)
         for key, record in self._paired_scores(nodes).items():
             scores.setdefault(key, record)
-        wins = sorted(set(labels) & LOCAL_AGENT_WIN_LABELS)
-        losses = sorted(set(labels) & LOCAL_AGENT_LOSS_LABELS)
+        result_actions = bool(set(labels) & LOCAL_AGENT_RESULT_ACTION_LABELS)
+        wins = sorted({local_agent_label(node.get("text") or node.get("content_desc") or node.get("description")) for node in nodes if local_agent_label(node.get("text") or node.get("content_desc") or node.get("description")) in LOCAL_AGENT_WIN_LABELS and (node.get("clickable") is not True or result_actions)})
+        losses = sorted({local_agent_label(node.get("text") or node.get("content_desc") or node.get("description")) for node in nodes if local_agent_label(node.get("text") or node.get("content_desc") or node.get("description")) in LOCAL_AGENT_LOSS_LABELS and (node.get("clickable") is not True or result_actions)})
         outcome = "win" if wins and not losses else "loss" if losses and not wins else "unknown"
         evidence = (wins if outcome == "win" else losses if outcome == "loss" else [""])[0]
         terminal_source = "accessibility" if outcome != "unknown" else ""
@@ -5784,7 +5877,8 @@ class GameAI:
         motion_points = self._motion_targets(package, png, samples, width, height, perception.get("noise_floor"), observation.get("capture_started_at", observation.get("timestamp")))
         if phase == "unknown" and not clickable and (motion_points or any(region["kind"] == "motion_target" for region in regions)):
             phase = "playing"
-        if outcome == "unknown" and phase != "loading" and not scores and turn == "unknown" and visual:
+        terminal_context = observation.get("previous_phase") in {"playing", "result"} or self._last_descriptors.get(package, {}).get("phase") in {"playing", "result"}
+        if outcome == "unknown" and phase != "loading" and not scores and turn == "unknown" and not active_control and terminal_context and visual:
             predicted, visual_evidence = self._visual_terminal_match(package, (width, height), visual)
             if predicted != "unknown":
                 outcome, evidence, terminal_source, phase = predicted, visual_evidence, "learned_visual_template", "result"
@@ -5805,6 +5899,7 @@ class GameAI:
         descriptor = {"package": package, "activity": activity, "state": state, "legacy_state": legacy_state, "capture_state": observation.get("state"), "size": (width, height), "features": features, "nodes": nodes, "clickable": clickable, "targets": targets, "scores": scores, "phase": phase, "turn": turn, "outcome": outcome, "evidence": evidence, "terminal_source": terminal_source, "points": points, "motion_points": motion_points, "samples": samples, "regions": regions}
         profile = local_agent_game_profile(descriptor)
         descriptor["profile"] = profile
+        descriptor["gameplay_signals"] = local_agent_game_observed_state(descriptor)
         descriptor["scene_graph"] = local_agent_balanced_scene(scene_nodes, profile["annotations"], regions, self._affordance_annotations(package, phase, (width, height)))
         descriptor["state_match"] = 0.0
         if self._db is not None and phase in {"playing", "unknown"} and visual:
@@ -6281,6 +6376,14 @@ class GameAI:
         if origin_phase != "playing":
             self._terminal_candidates.pop(package, None)
             return False
+        action_record = self._db.execute("SELECT action FROM agent_actions WHERE package=? AND state_key=? AND action_key=?", (package, observed["state_key"], observed["action_key"])).fetchone()
+        try:
+            credited_kind = json.loads(action_record["action"]).get("kind") if action_record is not None else None
+        except (ValueError, TypeError):
+            credited_kind = None
+        if credited_kind not in AI_TERMINAL_CREDIT_ACTIONS:
+            self._terminal_candidates.pop(package, None)
+            return False
         self._ensure_state(descriptor)
         reward = 1.0 if descriptor["outcome"] == "win" else -1.0
         prior_key = (package, observed["state_key"], observed["action_key"], observed["next_state"], observed["terminal"])
@@ -6390,7 +6493,8 @@ class GameAI:
                         rewards = affordance_record["reward_samples"]
                         demos = affordance_record["demonstrations"]
                         affordance_bonus = LOCAL_AGENT_AFFORDANCE_WEIGHT * (affordance_record["effect_sum"] / (effects + 1) + affordance_record["reward_sum"] / (rewards + 1) + demos / (demos + 1))
-                    value = row["q"] + intrinsic + uncertainty + candidate["prior"] / (row["visits"] + 1) + demonstration_bonus + recalled_bonus + transfer_bonus + AI_VISUAL_FEEDBACK_WEIGHT * visual_effect * effect_samples / (effect_samples + 1) + affordance_bonus - no_effect_penalty
+                    observed_bonus = LOCAL_AGENT_OBSERVED_GAME_CONTROL_PRIOR if candidate["source"] == "game_specific_observed_control" and descriptor["gameplay_signals"]["observed_ui"] else 0.0
+                    value = row["q"] + intrinsic + uncertainty + (candidate["prior"] + observed_bonus) / (row["visits"] + 1) + demonstration_bonus + recalled_bonus + transfer_bonus + AI_VISUAL_FEEDBACK_WEIGHT * visual_effect * effect_samples / (effect_samples + 1) + affordance_bonus - no_effect_penalty
                     candidate["no_effect_penalty"] = no_effect_penalty
                     ranked.append((value, -row["visits"], candidate["key"], candidate, row, uncertainty, intrinsic, recalled_bonus, remembered, transfer_bonus, transferred_count, affordance_bonus, affordance_record))
                 _, _, _, selected, learned, uncertainty, intrinsic, recalled_bonus, remembered, transfer_bonus, transferred_count, selected_affordance_bonus, selected_affordance = max(ranked, key=lambda item: item[:3])
@@ -6409,13 +6513,15 @@ class GameAI:
                 evidence = {"algorithm": "UCB + TD + empirical transition replay", "valid_candidates": len(candidates), "matched_observations": learned["visits"], "visits": learned["visits"], "demonstrations": learned["demonstrations"], "uncertainty": uncertainty, "exploration_bonus": uncertainty, "learned_value": learned["q"], "intrinsic_value": intrinsic, "verified_reward_samples": reward_samples, "transition_samples": int(package_samples["transitions"]), "planning_backups": backups, "reward_source": reward_source, "goal_known": bool(reward_samples or descriptor["scores"]), "mode": "reward_learning" if reward_samples else "exploration", "action_source": "human_demonstration" if selected["demonstration_restored"] else selected["source"], "recalled_experience_matches": remembered, "recalled_experience_bonus": recalled_bonus, "similar_state_reward_matches": transferred_count, "similar_state_reward_bonus": transfer_bonus, "cross_scene_control_matches": len(affordances), "cross_scene_control_bonus": selected_affordance_bonus, "cross_scene_control_attempts": selected_affordance["attempts"] if selected_affordance else 0, "repeated_no_effect_penalty": selected.get("no_effect_penalty", 0.0), "motion_targets": len(descriptor.get("motion_points", ())), "confidence_kind": "action_sample_support", "professional_skill_verified": False}
                 assessment = ("已执行动作证据 " + str(learned["visits"]) + " 次；" + ("利用已观测奖励与真实转移模型" if reward_samples else "暂无可靠成绩反馈，当前按访问次数与状态新奇度探索") + "。" + LOCAL_AGENT_LIMITATION)
                 actions = [selected["action"]]
-                result = {"game": descriptor["package"] or "当前安卓应用", "phase": descriptor["phase"], "task_state": {"goal": goal, "control_mode": mode, "turn": descriptor["turn"], "state_key": descriptor["state"], "rules": []}, "actions": actions, "confidence": learned["visits"] / (learned["visits"] + 1), "confidence_kind": "action_sample_support", "assessment": assessment, "expected": selected["label"] + "；效果将在实际执行后的新观察中核实", "reward_signal": {"outcome": descriptor["outcome"] if confirmed else "unknown", "score": next(iter(descriptor["scores"].values()))["value"] if len(descriptor["scores"]) == 1 else None, "health": None, "evidence": descriptor["evidence"] if confirmed else "", "verified": bool(confirmed), "confirmation_frames": list(self._terminal_candidates.get(descriptor["package"], {}).get("confirmation_frames", ())) if confirmed else []}, "preconditions": selected["preconditions"], "policy_evidence": evidence, "execution_capacity": len(actions), "local_policy": {"state": descriptor["state"], "action": selected["key"], "serial": self._plan_serial, "signature": AI_action_identity(relative_action(selected["action"], descriptor["size"]))}}
+                rules_evidence = sorted(descriptor["gameplay_signals"]["observed_ui"])
+                result = {"game": descriptor["package"] or "当前安卓应用", "phase": descriptor["phase"], "task_state": {"goal": goal, "control_mode": mode, "turn": descriptor["turn"], "state_key": descriptor["state"], "rules": ["界面已观测：" + label for label in rules_evidence]}, "actions": actions, "confidence": learned["visits"] / (learned["visits"] + 1), "confidence_kind": "action_sample_support", "assessment": assessment, "expected": selected["label"] + "；效果将在实际执行后的新观察中核实", "reward_signal": {"outcome": descriptor["outcome"] if confirmed else "unknown", "score": next(iter(descriptor["scores"].values()))["value"] if len(descriptor["scores"]) == 1 else None, "health": None, "evidence": descriptor["evidence"] if confirmed else "", "verified": bool(confirmed), "confirmation_frames": list(self._terminal_candidates.get(descriptor["package"], {}).get("confirmation_frames", ())) if confirmed else []}, "preconditions": selected["preconditions"], "policy_evidence": evidence, "execution_capacity": len(actions), "local_policy": {"state": descriptor["state"], "action": selected["key"], "serial": self._plan_serial, "signature": AI_action_identity(relative_action(selected["action"], descriptor["size"]))}}
                 result["expected_effect"] = dict(selected["expected_effect"])
                 result["local_policy"].update(source=evidence["action_source"], label=learned["label"] if selected["demonstration_restored"] else selected["label"])
                 result["policy_evidence"].update(restored_candidate=selected["recalled"], learned_action_reused=learned["visits"] > 0, visual_regions=len(descriptor["regions"]), visual_effect_samples=learned["effect_samples"], visual_effect_value=learned["effect_sum"] / learned["effect_samples"] if learned["effect_samples"] else None)
                 result["scene_graph"] = descriptor["scene_graph"][:LOCAL_AGENT_SMART_OVERLAY_LIMIT]
                 result["screen_size"] = [width for width in descriptor["size"]]
                 result["game_profile"] = {key: value for key, value in descriptor["profile"].items() if key not in {"anchors", "annotations"}}
+                result["game_profile"]["observable_state"] = descriptor["gameplay_signals"]
                 result["policy_evidence"]["recurrent_state_similarity"] = descriptor["state_match"]
                 result["policy_evidence"]["game_profile_evidence"] = descriptor["profile"]["evidence"]
                 result["policy_evidence"]["explicit_score_indicators"] = len(descriptor["scores"])
@@ -6441,6 +6547,8 @@ class GameAI:
             return {"learned": False, "reason": "action_not_applied"}
         if not all(isinstance(item, dict) for item in (before, after, action, plan)):
             return {"learned": False, "reason": "invalid_transition"}
+        if action.get("kind") in AI_OBSERVATION_ONLY_ACTIONS:
+            return {"learned": False, "reason": "observation_only"}
         package = str(before.get("package", ""))
         if not package or str(after.get("package", "")) != package:
             return {"learned": False, "reason": "package_changed"}
@@ -6506,7 +6614,8 @@ class GameAI:
             local_contrast = localized_effect["local_contrast"] if localized_effect is not None else 0.0
             visual_effect = max(relative_movement * LOCAL_AGENT_EFFECT_ATTENUATION, local_contrast) if eligible_visual else 0.0
             effect_confirmed = bool(eligible_visual and (relative_movement > LOCAL_AGENT_EFFECT_MINIMUM or local_contrast > visual_noise))
-            effect_measured = bool(eligible_visual and self._frame_fresh(before) and self._frame_fresh(after))
+            visual_pending = bool(result.get("post_action_visual_pending") and action.get("kind") in AI_TEMPORAL_CONTROL_ACTIONS)
+            effect_measured = bool(eligible_visual and not visual_pending and self._frame_fresh(before) and self._frame_fresh(after))
             expected = plan.get("expected_effect", {})
             ui_effect = None
             if isinstance(expected, dict) and expected.get("kind") == "node_state" and self._nodes_fresh(before) and self._nodes_fresh(after, applied):
@@ -6524,7 +6633,7 @@ class GameAI:
                         visual_effect = max(visual_effect, AI_VISUAL_FEEDBACK_WEIGHT)
             if not effect_measured or not effect_confirmed:
                 visual_effect = 0.0
-            effect_status = "confirmed_effect" if effect_measured and effect_confirmed else "confirmed_no_effect" if effect_measured else "unknown"
+            effect_status = "confirmed_effect" if effect_measured and effect_confirmed else "confirmed_no_effect" if effect_measured else "pending_motion_feedback" if visual_pending else "unknown"
 
             intrinsic = 1 / math.sqrt(second_state["visits"] + 1) if changed else 0.0
             seconds = max(0.0, local_agent_number(result.get("seconds"), captured - applied))
@@ -6978,6 +7087,21 @@ def vision_sample_grid(width, height):
     return columns, rows
 
 
+@functools.lru_cache(maxsize=AI_PERCEPTION_CACHE_FRAMES)
+def vision_edge_strengths(samples, size):
+    width, height = size
+    columns, rows = vision_sample_grid(width, height)
+    if not samples or len(samples) != columns * rows:
+        return ()
+    gradients = []
+    for index, color in enumerate(samples):
+        y, x = divmod(index, columns)
+        neighbors = (samples[(y + dy) * columns + x + dx] for dx, dy in LOCAL_AGENT_DIRECTIONS if 0 <= x + dx < columns and 0 <= y + dy < rows)
+        edges = [sum(abs(a - b) for a, b in zip(color, nearby)) / (AI_RGB_CHANNELS * AI_BYTE_MAX) for nearby in neighbors]
+        gradients.append(sum(edges) / len(edges) if edges else 0.0)
+    return tuple(gradients)
+
+
 def local_agent_visual_regions(samples, size, previous=(), noise=0.0):
     if not samples or not isinstance(size, (tuple, list)) or len(size) != AI_SPATIAL_DIMENSIONS:
         return []
@@ -6986,12 +7110,9 @@ def local_agent_visual_regions(samples, size, previous=(), noise=0.0):
     if len(samples) != columns * rows:
         return []
     temporal = len(previous) == len(samples)
-    gradient, motion, saturation = [], [], []
+    gradient = vision_edge_strengths(tuple(samples), (width, height))
+    motion, saturation = [], []
     for index, color in enumerate(samples):
-        y, x = divmod(index, columns)
-        neighbors = (samples[(y + dy) * columns + x + dx] for dx, dy in LOCAL_AGENT_DIRECTIONS if 0 <= x + dx < columns and 0 <= y + dy < rows)
-        edges = [sum(abs(a - b) for a, b in zip(color, nearby)) / (AI_RGB_CHANNELS * AI_BYTE_MAX) for nearby in neighbors]
-        gradient.append(sum(edges) / len(edges) if edges else 0.0)
         motion.append(sum(abs(a - b) for a, b in zip(color, previous[index])) / (AI_RGB_CHANNELS * AI_BYTE_MAX) if temporal else 0.0)
         saturation.append((max(color) - min(color)) / AI_BYTE_MAX)
     middle = statistics.median(gradient)
@@ -7459,7 +7580,7 @@ class MemoryStore:
         result = episode.get("result", {})
         if not isinstance(action, dict) or not isinstance(result, dict) or result.get("action_applied") is not True:
             return None
-        if action.get("kind") in {"type", "wait", "touch_release_all"}:
+        if action.get("kind") not in AI_TERMINAL_CREDIT_ACTIONS:
             return None
         size = episode.get("size", result.get("size"))
         if not isinstance(size, (list, tuple)) or len(size) != AI_SPATIAL_DIMENSIONS or any(type(value) is not int or value <= 0 for value in size):
@@ -7541,22 +7662,7 @@ class MemoryStore:
             return False
         reward = 1.0 if outcome == "win" else -1.0
         credited = 0
-        seen = set()
-        def apply_credit(episode, attributed_reward):
-            nonlocal credited
-            try:
-                identity = self._experience_identity(episode)
-            except (TypeError, ValueError, OverflowError):
-                return
-            if identity is None:
-                return
-            package, game, phase, context_key, _, action_key, _ = identity
-            key = (package, game, phase, context_key, action_key)
-            if key in seen:
-                return
-            if self._experience_credit(episode, attributed_reward, "outcome"):
-                seen.add(key)
-                credited += 1
+        attributed_actions = 0
         with self.lock, self.db:
             existing = self.db.execute("SELECT outcome FROM credited_outcomes WHERE episode_id=?", (episode_id,)).fetchone()
             if existing is not None:
@@ -7579,10 +7685,25 @@ class MemoryStore:
             retained.sort(key=lambda episode: local_agent_number(episode.get("result", {}).get("action_applied_at")))
             horizon = len(retained)
             discount = max(0.0, 1 - 1 / math.sqrt(horizon + 1))
+            aggregates = {}
             for distance, episode in enumerate(reversed(retained)):
-                apply_credit(episode, reward * discount ** distance)
+                try:
+                    identity = self._experience_identity(episode)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if identity is None or identity[2] not in {"playing", "unknown"}:
+                    continue
+                key = (identity[0], identity[1], identity[2], identity[3], identity[5])
+                if key not in aggregates:
+                    aggregates[key] = [episode, 0.0, 0]
+                aggregates[key][1] += reward * discount ** distance
+                aggregates[key][2] += 1
+                attributed_actions += 1
+            for episode, total_reward, occurrences in aggregates.values():
+                if self._experience_credit(episode, total_reward / occurrences, "outcome"):
+                    credited += 1
             self.db.execute("INSERT INTO credited_outcomes(episode_id,ts,outcome) VALUES(?,?,?)", (episode_id, utc_now(), outcome))
-            self.db.execute("INSERT INTO events(ts,kind,payload) VALUES(?,?,?)", (utc_now(), "verified_game_outcome", json.dumps({"signal": signal, "source": "distinct_result_frames", "attribution": "temporal_discounted_episode_association", "coverage": "retained_evidence", "retained_rows": dict(sources), "credited_state_actions": credited, "episode_id": episode_id}, ensure_ascii=False)))
+            self.db.execute("INSERT INTO events(ts,kind,payload) VALUES(?,?,?)", (utc_now(), "verified_game_outcome", json.dumps({"signal": signal, "source": "distinct_result_frames", "attribution": "per_episode_discounted_action_occurrence_mean", "coverage": "retained_evidence", "retained_rows": dict(sources), "credited_actions": attributed_actions, "credited_state_actions": credited, "episode_id": episode_id}, ensure_ascii=False)))
         return True
 
     def feedback(self, episode, effect, confidence, observation=None, confirmation=None):
@@ -8154,6 +8275,7 @@ class Controller:
         self._fast_generation = None
         self._fast_update_serial = 0
         self._fast_applied_serial = 0
+        self._fast_motion_confirmed_serial = 0
         self._fast_rejected_serial = 0
         self._fast_rejected_reason = ""
         self._fast_delivery = threading.Condition(self.lifecycle)
@@ -8528,13 +8650,15 @@ class Controller:
                     if self._pending_installs:
                         self._pending_installs[0].update(paths=[str(file) for file in files], files=[{"size": file.stat().st_size, "mtime_ns": file.stat().st_mtime_ns} for file in files])
                 self._save_pending_installs()
-                requirements = [apk_compatibility(file) for file in files]
-                required_api = max((int(item["min_sdk"]) for item in requirements if item.get("min_sdk") is not None), default=0)
+                requirements = [(file, apk_package_info(file), apk_compatibility(file)) for file in files]
+                required_api = max((int(item["min_sdk"]) for _, _, item in requirements if item.get("min_sdk") is not None), default=0)
                 package_abis = {}
-                for file, requirement in zip(files, requirements):
-                    package = apk_package_info(file)["package"]
-                    package_abis.setdefault(package, set()).update(requirement["native_abis"])
-                unsuitable_abis = {package: sorted(abis) for package, abis in package_abis.items() if abis and self.android.abis and abis.isdisjoint(self.android.abis)}
+                unsuitable_abis = {}
+                for file, metadata, requirement in requirements:
+                    abis = frozenset(requirement["native_abis"])
+                    package_abis.setdefault(metadata["package"], []).append(abis)
+                    if abis and self.android.abis and abis.isdisjoint(self.android.abis):
+                        unsuitable_abis[file.name] = {"package": metadata["package"], "native_abis": sorted(abis)}
                 old_api = self.android.device_api_level
                 if old_api and (required_api > old_api or unsuitable_abis):
                     if pending.get("restore_package"):
@@ -8545,7 +8669,7 @@ class Controller:
                             changed = self.android.switch_compatible_image(required_api, package_abis, cancel)
                     if changed:
                         raise ComponentFailure("android", "已切换 APK 兼容系统镜像，重新验证后自动完成安装")
-                    diagnostic = f"当前 Android API {old_api}，设备支持 {', '.join(self.android.abis) or '未知'}；APK 要求 API {required_api}"
+                    diagnostic = f"APK 兼容性检查：当前 Android API {old_api}，设备支持 {', '.join(self.android.abis) or '未知'}；APK 要求 API {required_api}"
                     if unsuitable_abis:
                         diagnostic += "；以下游戏原生库与设备不匹配：" + json.dumps(unsuitable_abis, ensure_ascii=False)
                     raise ValueError(diagnostic + "。请使用本机已有兼容模拟器；ARM-only 游戏无法仅靠切换 x86_64 系统镜像运行")
@@ -9393,7 +9517,8 @@ class Controller:
             self._fast_update_serial += 1
             serial = self._fast_update_serial
             self._fast_wake.set()
-            return {"submitted": True, "kind": kind, "pointers": len(updated), "serial": serial}
+            motion_finish = max((point["finish_at"] for point in updated.values() if (point["x"], point["y"]) != (point["x2"], point["y2"])), default=now)
+            return {"submitted": True, "kind": kind, "pointers": len(updated), "serial": serial, "motion_finished_at": motion_finish}
 
     def _await_fast_control(self, serial, generation, cancel, timeout=None):
         duration = max(RUNTIME_BOOTSTRAP_CONSOLE_TIMEOUT_SECONDS, self.tuning.deadline("input")) if timeout is None else float(timeout)
@@ -9410,6 +9535,20 @@ class Controller:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ComponentFailure("android", "实时触控动作未得到模拟器确认")
+                self._fast_delivery.wait(min(self.tuning.interval("input"), remaining))
+
+    def _await_fast_motion(self, serial, generation, cancel, finish_at):
+        deadline = max(time.monotonic(), finish_at) + self.tuning.deadline("input") + self.tuning.deadline("capture")
+        with self._fast_delivery:
+            while self._fast_motion_confirmed_serial < serial:
+                self._authorized(generation, cancel)
+                if self._fast_rejected_serial >= serial:
+                    raise GeometryPending(self._fast_rejected_reason)
+                if not self.android_ready or self._reset_android:
+                    raise ComponentFailure("android", "持续触控执行过程中设备连接已中断")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ComponentFailure("android", "触控轨迹结束后仍未收到最终位置确认")
                 self._fast_delivery.wait(min(self.tuning.interval("input"), remaining))
 
     def _fast_loop(self):
@@ -9442,6 +9581,8 @@ class Controller:
                             with self._fast_delivery:
                                 if self.generation == generation and self.desired_running:
                                     self._fast_applied_serial = max(self._fast_applied_serial, serial)
+                                    if not moving:
+                                        self._fast_motion_confirmed_serial = max(self._fast_motion_confirmed_serial, serial)
                                     self._fast_delivery.notify_all()
                 except Cancelled:
                     last_sent = ()
@@ -9462,6 +9603,10 @@ class Controller:
                     self._request_recovery("android", exc, generation)
             elif not authorized:
                 last_sent = ()
+            elif not moving and not pending and frame == last_sent:
+                with self._fast_delivery:
+                    self._fast_motion_confirmed_serial = max(self._fast_motion_confirmed_serial, serial)
+                    self._fast_delivery.notify_all()
             period = self.android.input_interval() if moving else self.tuning.interval("input") if current else self.tuning.deadline("capture")
             self._fast_wake.wait(max(self.tuning.clock_floor, period))
 
@@ -9778,6 +9923,8 @@ class Controller:
                         self._authorized(generation, cancel)
                         if action["kind"] in {"touch_begin", "touch_update", "touch_end", "touch_release_all"}:
                             self._await_fast_control(submitted["serial"], generation, cancel)
+                            if submitted.get("motion_finished_at", 0) > sent:
+                                self._await_fast_motion(submitted["serial"], generation, cancel, submitted["motion_finished_at"])
                             submitted["applied"] = True
                         self.completed_steps += 1
                         if action["kind"] == "wait":
